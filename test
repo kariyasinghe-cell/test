@@ -1,0 +1,162 @@
+Looking at your dry-run output, the dry-run ID is embedded in the file paths. From your example:
+/***_bkp/.***-updates/dry-run/***is-5.11.0-1769768372/repository/...
+The dry-run ID is 1769768372 (the number after the product version).
+Let me update the Ansible playbook to extract this:
+yaml    - name: WSO2 updates dry run
+      ansible.builtin.shell:
+        cmd: "export http_proxy='{{ http_proxy_url }}' && export https_proxy='{{ https_proxy_url }}' && ./wso2update_linux -u {{ wso2_update_username }} -p {{ wso2_update_password }} --dry-run --no-backup"
+        chdir: "{{ wso2_home }}/bin"
+      register: updates_dry_run
+      changed_when: false
+      failed_when: false
+      timeout: "{{ update_check_timeout }}"
+      become: false
+
+    - name: Display dry run output
+      ansible.builtin.debug:
+        msg: "{{ updates_dry_run.stdout_lines | default(['No output']) }}"
+
+    - name: Parse outputs and extract conflicts
+      ansible.builtin.shell: |
+        CURRENT_LEVEL=$(echo "{{ current_state_output.stdout | default('') }}" | grep -oP 'wso2.*-\d+\.\d+\.\d+\.\K\d+' | head -1)
+        [ -z "$CURRENT_LEVEL" ] && CURRENT_LEVEL="Unknown"
+        
+        LATEST_LEVEL=$(echo "{{ check_updates_output.stdout | default('') }}" | grep -oP "latest update level is '[^']*\.\K\d+(?=')" | head -1)
+        [ -z "$LATEST_LEVEL" ] && LATEST_LEVEL="Unknown"
+        
+        if echo "{{ current_state_output.stdout | default('') }}" | grep -qi "no hotfixes applied"; then
+          HOTFIXES="None"
+        else
+          HOTFIXES=$(echo "{{ current_state_output.stdout | default('') }}" | grep -oP '(?i)hotfix.*:\s*\K.+' | head -1)
+          [ -z "$HOTFIXES" ] && HOTFIXES="None"
+        fi
+        
+        UPDATES_COUNT=$(echo "{{ check_updates_output.stdout | default('') }}" | grep -oP '\d+(?=\s+updates applied)' | head -1)
+        [ -z "$UPDATES_COUNT" ] && UPDATES_COUNT="0"
+        
+        if [ "$CURRENT_LEVEL" != "Unknown" ] && [ "$LATEST_LEVEL" != "Unknown" ] && [ "$CURRENT_LEVEL" != "$LATEST_LEVEL" ]; then
+          UPDATES_AVAILABLE="true"
+        elif echo "{{ check_updates_output.stdout | default('') | lower }}" | grep -qiE "consists of.*updates"; then
+          UPDATES_AVAILABLE="true"
+        else
+          UPDATES_AVAILABLE="false"
+        fi
+        
+        # Parse conflicts and dry-run ID from dry run output
+        DRY_RUN_STDOUT="{{ updates_dry_run.stdout | default('') }}"
+        DRY_RUN_STDERR="{{ updates_dry_run.stderr | default('') }}"
+        HAS_CONFLICTS="false"
+        CONFLICTS_JSON="[]"
+        DRY_RUN_ID=""
+        DRY_RUN_PATH=""
+        
+        if echo "$DRY_RUN_STDERR" | grep -qi "conflicts encountered"; then
+          HAS_CONFLICTS="true"
+          
+          # Extract dry-run ID from file paths (e.g., wso2is-5.11.0-1769768372)
+          DRY_RUN_ID=$(echo "$DRY_RUN_STDOUT" | grep -oP 'dry-run/[^/]+-\K\d{10,}' | head -1)
+          
+          # Extract full dry-run path
+          DRY_RUN_PATH=$(echo "$DRY_RUN_STDOUT" | grep -oP '/[^[:space:]]*dry-run/[^/]+' | head -1)
+          
+          # Extract file paths between "File modification failed." and "Conflicts are found"
+          CONFLICT_FILES=$(echo "$DRY_RUN_STDOUT" | \
+            sed -n '/File modification failed/,/Conflicts are found/p' | \
+            grep -E '^\/' | \
+            sed 's/.*dry-run\/[^/]*\///' | \
+            head -20)
+          
+          if [ -n "$CONFLICT_FILES" ]; then
+            CONFLICTS_JSON=$(echo "$CONFLICT_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          fi
+        fi
+        
+        cat << EOF
+        {
+          "current_level": "$CURRENT_LEVEL",
+          "latest_level": "$LATEST_LEVEL",
+          "hotfixes": "$HOTFIXES",
+          "updates_count": "$UPDATES_COUNT",
+          "updates_available": $UPDATES_AVAILABLE,
+          "has_conflicts": $HAS_CONFLICTS,
+          "conflict_files": $CONFLICTS_JSON,
+          "dry_run_id": "$DRY_RUN_ID",
+          "dry_run_path": "$DRY_RUN_PATH"
+        }
+        EOF
+      register: parsed_output
+      delegate_to: localhost
+      become: false
+      changed_when: false
+Then update the Build update report task to include the new fields:
+yaml    - name: Set update variables
+      ansible.builtin.set_fact:
+        current_update_level: "{{ parsed_data.current_level }}"
+        latest_available_level: "{{ parsed_data.latest_level }}"
+        current_hotfixes: "{{ parsed_data.hotfixes }}"
+        available_updates_count: "{{ parsed_data.updates_count }}"
+        updates_available: "{{ parsed_data.updates_available }}"
+        has_conflicts: "{{ parsed_data.has_conflicts }}"
+        conflict_files: "{{ parsed_data.conflict_files }}"
+        dry_run_id: "{{ parsed_data.dry_run_id }}"
+        dry_run_path: "{{ parsed_data.dry_run_path }}"
+
+    - name: Build update report
+      ansible.builtin.set_fact:
+        update_report:
+          host: "{{ inventory_hostname }}"
+          ansible_host: "{{ ansible_host }}"
+          product: "{{ wso2_product | default('apim') }}"
+          product_version: "{{ wso2_version | default('Unknown') }}"
+          current_level: "{{ current_update_level }}"
+          latest_level: "{{ latest_available_level }}"
+          hotfixes_applied: "{{ current_hotfixes }}"
+          updates_available: "{{ updates_available }}"
+          updates_count: "{{ available_updates_count }}"
+          has_conflicts: "{{ has_conflicts }}"
+          conflict_files: "{{ conflict_files }}"
+          conflict_count: "{{ conflict_files | length }}"
+          dry_run_id: "{{ dry_run_id }}"
+          dry_run_path: "{{ dry_run_path }}"
+          status: "{{ update_status | trim }}"
+          status_emoji: "{{ update_status_emoji | trim }}"
+          tool_version: "{{ tool_version_output.stdout_lines[0] | default('Unknown') }}"
+          check_timestamp: "{{ ansible_date_time.iso8601 }}"
+Update the display report task:
+yaml    - name: Display update report
+      ansible.builtin.debug:
+        msg: |
+          ══════════════════════════════════════════════════════════════
+                       WSO2 UPDATE LEVEL CHECK REPORT
+          ══════════════════════════════════════════════════════════════
+           Host:              {{ update_report.host }}
+           Product:           {{ update_report.product }} {{ update_report.product_version }}
+           Current Level:     {{ update_report.current_level }}
+           Latest Level:      {{ update_report.latest_level }}
+           Hotfixes Applied:  {{ update_report.hotfixes_applied }}
+           Updates Available: {{ update_report.updates_count }}
+           Has Conflicts:     {{ update_report.has_conflicts }}
+           Conflict Count:    {{ update_report.conflict_count }}
+           Dry Run ID:        {{ update_report.dry_run_id | default('N/A') }}
+           Dry Run Path:      {{ update_report.dry_run_path | default('N/A') }}
+           Status:            {{ update_report.status_emoji }} {{ update_report.status }}
+           Tool Version:      {{ update_report.tool_version }}
+           Check Time:        {{ update_report.check_timestamp }}
+          ══════════════════════════════════════════════════════════════
+          {% if update_report.has_conflicts and update_report.conflict_files | length > 0 %}
+          
+           CONFLICT FILES:
+          {% for file in update_report.conflict_files %}
+             - {{ file }}
+          {% endfor %}
+          ══════════════════════════════════════════════════════════════
+          {% endif %}
+If you also want the dry-run ID in the GitHub Actions and Teams notification, add to the parse_report step:
+yaml            DRY_RUN_ID=$(jq -r '.dry_run_id // ""' "$REPORT_FILE")
+            DRY_RUN_PATH=$(jq -r '.dry_run_path // ""' "$REPORT_FILE")
+            
+            echo "dry_run_id=$DRY_RUN_ID" >> $GITHUB_OUTPUT
+            echo "dry_run_path=$DRY_RUN_PATH" >> $GITHUB_OUTPUT
+And add to the job outputs:
+yaml      dry_run_id: ${{ steps.parse_report.outputs.dry_run_id }}
+      dry_run_path: ${{ steps.parse_report.outputs.dry_run_path }}
