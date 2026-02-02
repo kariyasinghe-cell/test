@@ -1,0 +1,87 @@
+- name: Check if conflicts.json exists
+      ansible.builtin.stat:
+        path: "{{ wso2_updates_home | default('/wso2_bkp') }}/.wso2-updates/dry-run/conflicts.json"
+      register: conflicts_json_stat
+      when: has_conflicts | default(false)
+
+    - name: Read conflicts.json
+      ansible.builtin.slurp:
+        src: "{{ wso2_updates_home | default('/wso2_bkp') }}/.wso2-updates/dry-run/conflicts.json"
+      register: conflicts_json_content
+      when: 
+        - has_conflicts | default(false)
+        - conflicts_json_stat.stat.exists | default(false)
+
+    - name: Set conflicts data
+      ansible.builtin.set_fact:
+        conflicts_data: "{{ conflicts_json_content.content | b64decode | from_json }}"
+      when:
+        - has_conflicts | default(false)
+        - conflicts_json_content is defined
+        - conflicts_json_content.content is defined
+
+    - name: Fetch conflict file contents
+      ansible.builtin.slurp:
+        src: "{{ item.1 }}"
+      register: conflict_file_contents
+      loop: "{{ conflicts_data | default([]) | subelements(['original', 'new'], skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.1 | basename }}"
+      when:
+        - has_conflicts | default(false)
+        - conflicts_data is defined
+      failed_when: false
+
+    - name: Fetch original files
+      ansible.builtin.slurp:
+        src: "{{ item.original }}"
+      register: original_files
+      loop: "{{ conflicts_data | default([]) }}"
+      loop_control:
+        label: "{{ item.original | basename }}"
+      when:
+        - has_conflicts | default(false)
+        - conflicts_data is defined
+      failed_when: false
+
+    - name: Fetch new files
+      ansible.builtin.slurp:
+        src: "{{ item.new }}"
+      register: new_files
+      loop: "{{ conflicts_data | default([]) }}"
+      loop_control:
+        label: "{{ item.new | basename }}"
+      when:
+        - has_conflicts | default(false)
+        - conflicts_data is defined
+      failed_when: false
+
+    - name: Build conflict comparisons
+      ansible.builtin.set_fact:
+        conflict_comparisons: "{{ conflict_comparisons | default([]) + [comparison_item] }}"
+      vars:
+        comparison_item:
+          filename: "{{ item.item.original | regex_replace('.*dry-run/[^/]+/', '') | regex_replace('\\.original$', '') }}"
+          original_path: "{{ item.item.original }}"
+          new_path: "{{ item.item.new }}"
+          original_content: "{{ item.content | default('') | b64decode }}"
+          new_content: "{{ (new_files.results[idx].content | default('')) | b64decode }}"
+      loop: "{{ original_files.results | default([]) }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.item.original | basename }}"
+      when:
+        - has_conflicts | default(false)
+        - original_files is defined
+        - original_files.results is defined
+
+    - name: Save conflict comparisons to JSON
+      ansible.builtin.copy:
+        content: "{{ conflict_comparisons | default([]) | to_nice_json }}"
+        dest: "/tmp/wso2_conflict_comparisons_{{ inventory_hostname }}.json"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+      when:
+        - has_conflicts | default(false)
+        - conflict_comparisons is defined
