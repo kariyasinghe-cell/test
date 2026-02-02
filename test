@@ -1,22 +1,80 @@
-- name: Build update report
-      ansible.builtin.set_fact:
-        update_report:
-          host: "{{ inventory_hostname }}"
-          ansible_host: "{{ ansible_host }}"
-          product: "{{ wso2_product | default('apim') }}"
-          product_version: "{{ wso2_version | default('Unknown') }}"
-          current_level: "{{ current_update_level }}"
-          latest_level: "{{ latest_available_level }}"
-          hotfixes_applied: "{{ current_hotfixes }}"
-          updates_available: "{{ updates_available }}"
-          updates_count: "{{ available_updates_count }}"
-          has_conflicts: "{{ has_conflicts }}"
-          conflict_files: "{{ conflict_files }}"
-          conflict_count: "{{ conflict_files | length }}"
-          dry_run_id: "{{ dry_run_id }}"
-          dry_run_path: "{{ dry_run_path }}"
-          report_url: "{{ report_url | default('') }}"
-          status: "{{ update_status | trim }}"
-          status_emoji: "{{ update_status_emoji | trim }}"
-          tool_version: "{{ tool_version_output.stdout_lines[0] | default('Unknown') }}"
-          check_timestamp: "{{ ansible_date_time.iso8601 }}"
+4. Update GitHub Actions to parse report_url
+Update the parse_report step to extract the report URL:
+yaml      - name: Parse update report
+        id: parse_report
+        run: |
+          REPORT_FILE=$(ls /tmp/wso2_update_report_*.json 2>/dev/null | head -1)
+          
+          if [ -f "$REPORT_FILE" ]; then
+            echo "Found report: $REPORT_FILE"
+            cat "$REPORT_FILE"
+            
+            # ... existing parsing code ...
+            
+            # Add report URL parsing
+            REPORT_URL=$(jq -r '.report_url // ""' "$REPORT_FILE")
+            echo "report_url=$REPORT_URL" >> $GITHUB_OUTPUT
+            
+            # ... rest of existing code ...
+          else
+            # ... existing else block ...
+            echo "report_url=" >> $GITHUB_OUTPUT
+          fi
+Add to job outputs:
+yaml    outputs:
+      # ... existing outputs ...
+      report_url: ${{ steps.parse_report.outputs.report_url }}
+5. Update Teams notification to include report button
+yaml      - name: Send Teams notification
+        run: |
+          # ... existing code to get values ...
+          
+          REPORT_URL="${{ needs.check-updates.outputs.report_url }}"
+          
+          # ... existing code ...
+          
+          # Build potential actions with report link
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              --arg report_url "$REPORT_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 View Conflict Report",
+                  "targets": [{ "os": "default", "uri": $report_url }]
+                }
+              ]')
+          else
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                }
+              ]')
+          fi
+          
+          # Build final payload
+          JSON_PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg theme "$THEME_COLOR" \
+            --argjson sections "$SECTIONS" \
+            --argjson actions "$ACTIONS" \
+            '{
+              "@type": "MessageCard",
+              "@context": "http://schema.org/extensions",
+              "themeColor": $theme,
+              "summary": $title,
+              "sections": $sections,
+              "potentialAction": $actions
+            }')
+          
+          # ... rest of notification code ...
