@@ -12,6 +12,6 @@ else
             echo "conflict_count=0" >> $GITHUB_OUTPUT
             echo "conflict_files=None" >> $GITHUB_OUTPUT
             echo "conflict_files_json=[]" >> $GITHUB_OUTPUT
-            echo "dry_run_id=$DRY_RUN_ID" >> $GITHUB_OUTPUT
-            echo "dry_run_path=$DRY_RUN_PATH" >> $GITHUB_OUTPUT
+            echo "dry_run_id=" >> $GITHUB_OUTPUT
+            echo "dry_run_path=" >> $GITHUB_OUTPUT
           fi
