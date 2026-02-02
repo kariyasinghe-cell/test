@@ -14,8 +14,19 @@
           echo "Found comparisons file: $COMPARISONS_FILE_FOUND"
           cat "$COMPARISONS_FILE_FOUND"
           
-          # Install required packages using python3 -m pip
+          # Install pip if not available, then install reportlab
+          if ! python3 -m pip --version &>/dev/null; then
+            echo "Installing pip..."
+            curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py
+            python3 /tmp/get-pip.py --user --quiet
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+          
+          # Install required packages
           python3 -m pip install --user --quiet reportlab
+          
+          # Add local bin to PATH for this session
+          export PATH="$HOME/.local/bin:$PATH"
           
           # Create PDF generation script
           cat > /tmp/generate_diff_pdf.py << 'PYTHON_SCRIPT'
