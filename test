@@ -1,258 +1,93 @@
-- name: Generate conflict comparison report
-        id: generate_pdf
-        if: steps.parse_report.outputs.has_conflicts == 'true'
+- name: Upload conflict report artifact
+        id: upload_artifact
+        if: steps.generate_pdf.outputs.report_generated == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HTTP_PROXY: 'http://your-proxy-url:port'
+          HTTPS_PROXY: 'http://your-proxy-url:port'
         run: |
-          COMPARISONS_FILE="/tmp/wso2_conflict_comparisons_*.json"
-          COMPARISONS_FILE_FOUND=$(ls $COMPARISONS_FILE 2>/dev/null | head -1)
+          REPORT_FILE="${{ steps.generate_pdf.outputs.report_path }}"
+          REPORT_NAME=$(basename "$REPORT_FILE")
+          ARTIFACT_NAME="wso2-conflict-report"
           
-          if [ -z "$COMPARISONS_FILE_FOUND" ] || [ ! -f "$COMPARISONS_FILE_FOUND" ]; then
-            echo "No comparisons file found, skipping report generation"
-            echo "pdf_generated=false" >> $GITHUB_OUTPUT
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "Report file not found: $REPORT_FILE"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
           
-          echo "Found comparisons file: $COMPARISONS_FILE_FOUND"
+          echo "Uploading artifact: $REPORT_NAME"
+          echo "File size: $(stat -c%s "$REPORT_FILE") bytes"
           
-          # Create HTML report generation script (no external dependencies)
-          cat > /tmp/generate_diff_report.py << 'PYTHON_SCRIPT'
-          #!/usr/bin/env python3
-          import json
-          import sys
-          import difflib
-          from datetime import datetime
-          import html
-
-          def create_diff_html(comparisons_file, output_file, environment, product, current_level, latest_level):
-              # Load comparisons
-              with open(comparisons_file, 'r') as f:
-                  comparisons = json.load(f)
-              
-              if not comparisons:
-                  print("No comparisons to process")
-                  return False
-              
-              report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-              
-              html_content = f'''<!DOCTYPE html>
-          <html lang="en">
-          <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>WSO2 Update Conflict Report</title>
-              <style>
-                  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
-                  .container {{ max-width: 1400px; margin: 0 auto; padding: 20px; }}
-                  .header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: white; padding: 40px; border-radius: 10px; margin-bottom: 30px; text-align: center; }}
-                  .header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
-                  .header p {{ opacity: 0.8; font-size: 1.1em; }}
-                  .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 30px 0; }}
-                  .info-card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                  .info-card .label {{ font-size: 0.85em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }}
-                  .info-card .value {{ font-size: 1.4em; font-weight: 600; color: #1a1a2e; margin-top: 5px; }}
-                  .legend {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                  .legend h3 {{ margin-bottom: 15px; color: #1a1a2e; }}
-                  .legend-items {{ display: flex; gap: 30px; flex-wrap: wrap; }}
-                  .legend-item {{ display: flex; align-items: center; gap: 10px; }}
-                  .legend-color {{ width: 20px; height: 20px; border-radius: 4px; }}
-                  .legend-color.added {{ background: #d4edda; border: 1px solid #28a745; }}
-                  .legend-color.removed {{ background: #f8d7da; border: 1px solid #dc3545; }}
-                  .legend-color.context {{ background: #f8f9fa; border: 1px solid #6c757d; }}
-                  .file-section {{ background: white; border-radius: 10px; margin-bottom: 30px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-                  .file-header {{ background: #e9ecef; padding: 20px; border-bottom: 1px solid #dee2e6; }}
-                  .file-header h2 {{ font-size: 1.1em; color: #495057; word-break: break-all; }}
-                  .file-header .file-number {{ background: #1a1a2e; color: white; padding: 4px 12px; border-radius: 20px; font-size: 0.85em; margin-right: 10px; }}
-                  .diff-container {{ overflow-x: auto; }}
-                  .diff-table {{ width: 100%; border-collapse: collapse; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 12px; }}
-                  .diff-table tr {{ border-bottom: 1px solid #eee; }}
-                  .diff-table td {{ padding: 2px 10px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }}
-                  .diff-table .line-num {{ width: 50px; text-align: right; color: #adb5bd; background: #f8f9fa; user-select: none; border-right: 1px solid #dee2e6; }}
-                  .diff-table .line-content {{ padding-left: 15px; }}
-                  .diff-table tr.added {{ background: #d4edda; }}
-                  .diff-table tr.added .line-content {{ color: #155724; }}
-                  .diff-table tr.removed {{ background: #f8d7da; }}
-                  .diff-table tr.removed .line-content {{ color: #721c24; }}
-                  .diff-table tr.header {{ background: #cce5ff; }}
-                  .diff-table tr.header .line-content {{ color: #004085; font-weight: bold; }}
-                  .diff-table tr.range {{ background: #e2e3e5; }}
-                  .diff-table tr.range .line-content {{ color: #383d41; }}
-                  .no-diff {{ padding: 40px; text-align: center; color: #6c757d; font-style: italic; }}
-                  .truncated {{ padding: 15px; background: #fff3cd; color: #856404; text-align: center; border-top: 1px solid #ffeeba; }}
-                  .footer {{ text-align: center; padding: 30px; color: #6c757d; font-size: 0.9em; }}
-                  @media print {{
-                      body {{ background: white; }}
-                      .container {{ max-width: 100%; }}
-                      .file-section {{ break-inside: avoid; }}
-                  }}
-              </style>
-          </head>
-          <body>
-              <div class="container">
-                  <div class="header">
-                      <h1>🔄 WSO2 Update Conflict Report</h1>
-                      <p>Automated conflict detection for WSO2 updates</p>
-                  </div>
-                  
-                  <div class="info-grid">
-                      <div class="info-card">
-                          <div class="label">Environment</div>
-                          <div class="value">{html.escape(environment)}</div>
-                      </div>
-                      <div class="info-card">
-                          <div class="label">Product</div>
-                          <div class="value">{html.escape(product)}</div>
-                      </div>
-                      <div class="info-card">
-                          <div class="label">Current Level</div>
-                          <div class="value">v{html.escape(current_level)}</div>
-                      </div>
-                      <div class="info-card">
-                          <div class="label">Target Level</div>
-                          <div class="value">v{html.escape(latest_level)}</div>
-                      </div>
-                      <div class="info-card">
-                          <div class="label">Files with Conflicts</div>
-                          <div class="value">{len(comparisons)}</div>
-                      </div>
-                      <div class="info-card">
-                          <div class="label">Report Generated</div>
-                          <div class="value" style="font-size: 1em;">{report_time}</div>
-                      </div>
-                  </div>
-                  
-                  <div class="legend">
-                      <h3>Legend</h3>
-                      <div class="legend-items">
-                          <div class="legend-item">
-                              <div class="legend-color added"></div>
-                              <span>Added lines (in new version)</span>
-                          </div>
-                          <div class="legend-item">
-                              <div class="legend-color removed"></div>
-                              <span>Removed lines (from your version)</span>
-                          </div>
-                          <div class="legend-item">
-                              <div class="legend-color context"></div>
-                              <span>Context (unchanged)</span>
-                          </div>
-                      </div>
-                  </div>
-          '''
-              
-              # Process each file comparison
-              for idx, comp in enumerate(comparisons, 1):
-                  filename = comp.get('filename', 'Unknown file')
-                  original_content = comp.get('original_content', '')
-                  new_content = comp.get('new_content', '')
-                  
-                  html_content += f'''
-                  <div class="file-section">
-                      <div class="file-header">
-                          <h2><span class="file-number">File {idx}</span>{html.escape(filename)}</h2>
-                      </div>
-                      <div class="diff-container">
-          '''
-                  
-                  # Generate unified diff
-                  original_lines = original_content.splitlines(keepends=True)
-                  new_lines = new_content.splitlines(keepends=True)
-                  
-                  diff = list(difflib.unified_diff(
-                      original_lines,
-                      new_lines,
-                      fromfile='Original (Your Version)',
-                      tofile='New (Update Version)',
-                      lineterm=''
-                  ))
-                  
-                  if not diff:
-                      html_content += '<div class="no-diff">No differences found in this file.</div>'
-                  else:
-                      html_content += '<table class="diff-table">'
-                      line_num = 0
-                      max_lines = 1000  # Limit lines per file
-                      
-                      for line in diff[:max_lines]:
-                          line_num += 1
-                          line_clean = line.rstrip('\n\r')
-                          line_escaped = html.escape(line_clean)
-                          
-                          if line.startswith('+++') or line.startswith('---'):
-                              row_class = 'header'
-                          elif line.startswith('@@'):
-                              row_class = 'range'
-                          elif line.startswith('+'):
-                              row_class = 'added'
-                          elif line.startswith('-'):
-                              row_class = 'removed'
-                          else:
-                              row_class = ''
-                          
-                          html_content += f'<tr class="{row_class}"><td class="line-num">{line_num}</td><td class="line-content">{line_escaped}</td></tr>'
-                      
-                      if len(diff) > max_lines:
-                          html_content += f'</table><div class="truncated">⚠️ Output truncated: {len(diff) - max_lines} more lines not shown</div>'
-                      else:
-                          html_content += '</table>'
-                  
-                  html_content += '''
-                      </div>
-                  </div>
-          '''
-              
-              html_content += '''
-                  <div class="footer">
-                      <p>Generated by WSO2 Update Check Workflow</p>
-                  </div>
-              </div>
-          </body>
-          </html>
-          '''
-              
-              with open(output_file, 'w', encoding='utf-8') as f:
-                  f.write(html_content)
-              
-              print(f"HTML report generated: {output_file}")
-              return True
-
-          if __name__ == "__main__":
-              comparisons_file = sys.argv[1]
-              output_file = sys.argv[2]
-              environment = sys.argv[3] if len(sys.argv) > 3 else "Unknown"
-              product = sys.argv[4] if len(sys.argv) > 4 else "WSO2"
-              current_level = sys.argv[5] if len(sys.argv) > 5 else "Unknown"
-              latest_level = sys.argv[6] if len(sys.argv) > 6 else "Unknown"
-              
-              success = create_diff_html(comparisons_file, output_file, environment, product, current_level, latest_level)
-              sys.exit(0 if success else 1)
-          PYTHON_SCRIPT
+          # Compress the file
+          ARCHIVE_FILE="/tmp/${ARTIFACT_NAME}.zip"
+          zip -j "$ARCHIVE_FILE" "$REPORT_FILE"
           
-          chmod +x /tmp/generate_diff_report.py
+          # Get the Actions runtime URL and token from environment
+          # These are automatically set by GitHub Actions
+          ACTIONS_RUNTIME_URL="${ACTIONS_RUNTIME_URL:-}"
+          ACTIONS_RUNTIME_TOKEN="${ACTIONS_RUNTIME_TOKEN:-}"
           
-          # Generate HTML Report
-          ENVIRONMENT="${{ steps.env.outputs.environment }}"
-          PRODUCT="${{ steps.parse_report.outputs.product }} ${{ steps.parse_report.outputs.product_version }}"
-          CURRENT_LEVEL="${{ steps.parse_report.outputs.current_level }}"
-          LATEST_LEVEL="${{ steps.parse_report.outputs.latest_level }}"
-          
-          REPORT_FILE="/tmp/wso2_conflict_report_${ENVIRONMENT}_$(date +%Y%m%d_%H%M%S).html"
-          
-          python3 /tmp/generate_diff_report.py "$COMPARISONS_FILE_FOUND" "$REPORT_FILE" "$ENVIRONMENT" "$PRODUCT" "$CURRENT_LEVEL" "$LATEST_LEVEL"
-          
-          if [ -f "$REPORT_FILE" ]; then
-            echo "Report generated successfully: $REPORT_FILE"
-            echo "pdf_path=$REPORT_FILE" >> $GITHUB_OUTPUT
-            echo "pdf_generated=true" >> $GITHUB_OUTPUT
-            echo "pdf_name=$(basename $REPORT_FILE)" >> $GITHUB_OUTPUT
+          if [ -n "$ACTIONS_RUNTIME_URL" ] && [ -n "$ACTIONS_RUNTIME_TOKEN" ]; then
+            echo "Using Actions Runtime API..."
+            
+            # Create artifact container
+            CREATE_URL="${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${{ github.run_id }}/artifacts?api-version=6.0-preview"
+            
+            CREATE_RESPONSE=$(curl -s -X POST \
+              --proxy "${HTTPS_PROXY}" \
+              -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json;api-version=6.0-preview" \
+              "$CREATE_URL" \
+              -d "{\"type\":\"actions_storage\",\"name\":\"$ARTIFACT_NAME\"}")
+            
+            echo "Create response: $CREATE_RESPONSE"
+            
+            UPLOAD_URL=$(echo "$CREATE_RESPONSE" | jq -r '.fileContainerResourceUrl')
+            
+            if [ -n "$UPLOAD_URL" ] && [ "$UPLOAD_URL" != "null" ]; then
+              # Upload the file
+              UPLOAD_RESPONSE=$(curl -s -X PUT \
+                --proxy "${HTTPS_PROXY}" \
+                -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                -H "Content-Range: bytes 0-$(($(stat -c%s "$ARCHIVE_FILE") - 1))/*" \
+                --data-binary @"$ARCHIVE_FILE" \
+                "${UPLOAD_URL}?itemPath=${ARTIFACT_NAME}/${REPORT_NAME}")
+              
+              echo "Upload response: $UPLOAD_RESPONSE"
+              
+              # Finalize the artifact
+              FINALIZE_URL="${ACTIONS_RUNTIME_URL}_apis/pipelines/workflows/${{ github.run_id }}/artifacts?api-version=6.0-preview"
+              
+              FINALIZE_RESPONSE=$(curl -s -X PATCH \
+                --proxy "${HTTPS_PROXY}" \
+                -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+                -H "Content-Type: application/json" \
+                "$FINALIZE_URL" \
+                -d "{\"name\":\"$ARTIFACT_NAME\",\"size\":$(stat -c%s "$ARCHIVE_FILE")}")
+              
+              echo "Finalize response: $FINALIZE_RESPONSE"
+              echo "uploaded=true" >> $GITHUB_OUTPUT
+            else
+              echo "Failed to get upload URL"
+              echo "uploaded=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "Failed to generate report"
-            echo "pdf_generated=false" >> $GITHUB_OUTPUT
+            echo "Actions Runtime API not available, saving locally..."
+            
+            # Save to a persistent location
+            REPORTS_DIR="/opt/wso2-reports"
+            mkdir -p "$REPORTS_DIR" 2>/dev/null || {
+              REPORTS_DIR="/tmp/wso2-reports"
+              mkdir -p "$REPORTS_DIR"
+            }
+            
+            cp "$REPORT_FILE" "$REPORTS_DIR/"
+            echo "Report saved to: $REPORTS_DIR/$REPORT_NAME"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            echo "local_path=$REPORTS_DIR/$REPORT_NAME" >> $GITHUB_OUTPUT
           fi
-
-      - name: Upload conflict report artifact
-        if: steps.generate_pdf.outputs.pdf_generated == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: wso2-conflict-report
-          path: ${{ steps.generate_pdf.outputs.pdf_path }}
-          retention-days: 30
+          
+          echo "report_name=$REPORT_NAME" >> $GITHUB_OUTPUT
