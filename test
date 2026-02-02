@@ -1,273 +1,193 @@
-      - name: Generate conflict comparison PDF
-        id: generate_pdf
-        if: needs.check-updates.outputs.has_conflicts == 'true'
+notify-teams:
+    name: Send Teams Notification
+    runs-on: ubuntu-latest
+    needs: check-updates
+    if: always()
+    env:
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+    steps:
+      - name: Install jq
         run: |
-          COMPARISONS_FILE="/tmp/wso2_conflict_comparisons_*.json"
-          COMPARISONS_FILE=$(ls $COMPARISONS_FILE 2>/dev/null | head -1)
+          INSTALL_DIR="/tmp/bin"
+          mkdir -p "$INSTALL_DIR"
           
-          if [ ! -f "$COMPARISONS_FILE" ]; then
-            echo "No comparisons file found, skipping PDF generation"
-            echo "pdf_generated=false" >> $GITHUB_OUTPUT
+          if [ ! -x "$INSTALL_DIR/jq" ]; then
+            curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$INSTALL_DIR/jq"
+            chmod +x "$INSTALL_DIR/jq"
+          fi
+          
+          echo "$INSTALL_DIR" >> $GITHUB_PATH
+
+      - name: Send Teams notification
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "Teams webhook not configured, skipping"
             exit 0
           fi
           
-          # Install required packages
-          pip install --quiet reportlab diff-match-patch pygments
-          
-          # Create PDF generation script
-          cat > /tmp/generate_diff_pdf.py << 'PYTHON_SCRIPT'
-          #!/usr/bin/env python3
-          import json
-          import sys
-          import difflib
-          from datetime import datetime
-          from reportlab.lib import colors
-          from reportlab.lib.pagesizes import A4, landscape
-          from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-          from reportlab.lib.units import inch, mm
-          from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Preformatted
-          from reportlab.lib.enums import TA_LEFT, TA_CENTER
-          from reportlab.pdfbase import pdfmetrics
-          from reportlab.pdfbase.ttfonts import TTFont
-          import os
-
-          def create_diff_pdf(comparisons_file, output_file, environment, product, current_level, latest_level):
-              # Load comparisons
-              with open(comparisons_file, 'r') as f:
-                  comparisons = json.load(f)
-              
-              if not comparisons:
-                  print("No comparisons to process")
-                  return False
-              
-              # Create PDF
-              doc = SimpleDocTemplate(
-                  output_file,
-                  pagesize=landscape(A4),
-                  rightMargin=20*mm,
-                  leftMargin=20*mm,
-                  topMargin=20*mm,
-                  bottomMargin=20*mm
-              )
-              
-              styles = getSampleStyleSheet()
-              
-              # Custom styles
-              title_style = ParagraphStyle(
-                  'CustomTitle',
-                  parent=styles['Heading1'],
-                  fontSize=24,
-                  spaceAfter=30,
-                  alignment=TA_CENTER,
-                  textColor=colors.HexColor('#1a1a2e')
-              )
-              
-              subtitle_style = ParagraphStyle(
-                  'CustomSubtitle',
-                  parent=styles['Normal'],
-                  fontSize=12,
-                  spaceAfter=20,
-                  alignment=TA_CENTER,
-                  textColor=colors.HexColor('#4a4a4a')
-              )
-              
-              heading_style = ParagraphStyle(
-                  'FileHeading',
-                  parent=styles['Heading2'],
-                  fontSize=14,
-                  spaceBefore=20,
-                  spaceAfter=10,
-                  textColor=colors.HexColor('#2d3436'),
-                  backColor=colors.HexColor('#dfe6e9'),
-                  borderPadding=5
-              )
-              
-              code_style = ParagraphStyle(
-                  'CodeStyle',
-                  parent=styles['Code'],
-                  fontSize=7,
-                  leading=9,
-                  fontName='Courier',
-                  leftIndent=10,
-                  rightIndent=10
-              )
-              
-              added_style = ParagraphStyle(
-                  'AddedLine',
-                  parent=code_style,
-                  backColor=colors.HexColor('#d4edda'),
-                  textColor=colors.HexColor('#155724')
-              )
-              
-              removed_style = ParagraphStyle(
-                  'RemovedLine',
-                  parent=code_style,
-                  backColor=colors.HexColor('#f8d7da'),
-                  textColor=colors.HexColor('#721c24')
-              )
-              
-              context_style = ParagraphStyle(
-                  'ContextLine',
-                  parent=code_style,
-                  textColor=colors.HexColor('#6c757d')
-              )
-              
-              elements = []
-              
-              # Title page
-              elements.append(Spacer(1, 50))
-              elements.append(Paragraph("WSO2 Update Conflict Report", title_style))
-              elements.append(Spacer(1, 20))
-              
-              # Report info table
-              report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-              info_data = [
-                  ["Environment:", environment],
-                  ["Product:", product],
-                  ["Current Level:", f"v{current_level}"],
-                  ["Target Level:", f"v{latest_level}"],
-                  ["Files with Conflicts:", str(len(comparisons))],
-                  ["Report Generated:", report_time]
-              ]
-              
-              info_table = Table(info_data, colWidths=[150, 300])
-              info_table.setStyle(TableStyle([
-                  ('FONT', (0, 0), (0, -1), 'Helvetica-Bold'),
-                  ('FONT', (1, 0), (1, -1), 'Helvetica'),
-                  ('FONTSIZE', (0, 0), (-1, -1), 11),
-                  ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
-                  ('TOPPADDING', (0, 0), (-1, -1), 8),
-                  ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                  ('ALIGN', (1, 0), (1, -1), 'LEFT'),
-                  ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#2d3436')),
-                  ('TEXTCOLOR', (1, 0), (1, -1), colors.HexColor('#636e72')),
-              ]))
-              elements.append(info_table)
-              
-              elements.append(Spacer(1, 30))
-              elements.append(Paragraph(
-                  "This report contains a diff comparison between the original files (your current customizations) "
-                  "and the new files (from WSO2 updates). Lines marked in <font color='green'>green</font> are additions, "
-                  "lines marked in <font color='red'>red</font> are removals.",
-                  subtitle_style
-              ))
-              
-              elements.append(PageBreak())
-              
-              # Process each file comparison
-              for idx, comp in enumerate(comparisons, 1):
-                  filename = comp.get('filename', 'Unknown file')
-                  original_content = comp.get('original_content', '')
-                  new_content = comp.get('new_content', '')
-                  
-                  # File header
-                  elements.append(Paragraph(f"File {idx}: {filename}", heading_style))
-                  
-                  # Generate unified diff
-                  original_lines = original_content.splitlines(keepends=True)
-                  new_lines = new_content.splitlines(keepends=True)
-                  
-                  diff = list(difflib.unified_diff(
-                      original_lines,
-                      new_lines,
-                      fromfile='Original (Current)',
-                      tofile='New (Update)',
-                      lineterm=''
-                  ))
-                  
-                  if not diff:
-                      elements.append(Paragraph("No differences found.", context_style))
-                  else:
-                      # Build diff table
-                      diff_data = []
-                      line_num = 0
-                      
-                      for line in diff[:500]:  # Limit to 500 lines per file
-                          line_num += 1
-                          line_clean = line.rstrip('\n\r')
-                          
-                          # Escape special characters for PDF
-                          line_escaped = (line_clean
-                              .replace('&', '&amp;')
-                              .replace('<', '&lt;')
-                              .replace('>', '&gt;'))
-                          
-                          if line.startswith('+++') or line.startswith('---'):
-                              diff_data.append([str(line_num), Paragraph(f"<b>{line_escaped}</b>", context_style)])
-                          elif line.startswith('@@'):
-                              diff_data.append([str(line_num), Paragraph(f"<font color='blue'>{line_escaped}</font>", context_style)])
-                          elif line.startswith('+'):
-                              diff_data.append([str(line_num), Paragraph(line_escaped, added_style)])
-                          elif line.startswith('-'):
-                              diff_data.append([str(line_num), Paragraph(line_escaped, removed_style)])
-                          else:
-                              diff_data.append([str(line_num), Paragraph(line_escaped, context_style)])
-                      
-                      if len(diff) > 500:
-                          diff_data.append(['...', Paragraph(f"<i>Truncated: {len(diff) - 500} more lines</i>", context_style)])
-                      
-                      if diff_data:
-                          diff_table = Table(diff_data, colWidths=[40, 700])
-                          diff_table.setStyle(TableStyle([
-                              ('FONT', (0, 0), (-1, -1), 'Courier', 7),
-                              ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                              ('ALIGN', (0, 0), (0, -1), 'RIGHT'),
-                              ('TEXTCOLOR', (0, 0), (0, -1), colors.HexColor('#adb5bd')),
-                              ('LEFTPADDING', (0, 0), (-1, -1), 3),
-                              ('RIGHTPADDING', (0, 0), (-1, -1), 3),
-                              ('TOPPADDING', (0, 0), (-1, -1), 1),
-                              ('BOTTOMPADDING', (0, 0), (-1, -1), 1),
-                          ]))
-                          elements.append(diff_table)
-                  
-                  if idx < len(comparisons):
-                      elements.append(PageBreak())
-              
-              # Build PDF
-              doc.build(elements)
-              print(f"PDF generated: {output_file}")
-              return True
-
-          if __name__ == "__main__":
-              comparisons_file = sys.argv[1]
-              output_file = sys.argv[2]
-              environment = sys.argv[3] if len(sys.argv) > 3 else "Unknown"
-              product = sys.argv[4] if len(sys.argv) > 4 else "WSO2"
-              current_level = sys.argv[5] if len(sys.argv) > 5 else "Unknown"
-              latest_level = sys.argv[6] if len(sys.argv) > 6 else "Unknown"
-              
-              success = create_diff_pdf(comparisons_file, output_file, environment, product, current_level, latest_level)
-              sys.exit(0 if success else 1)
-          PYTHON_SCRIPT
-          
-          chmod +x /tmp/generate_diff_pdf.py
-          
-          # Generate PDF
-          ENVIRONMENT="${{ steps.env.outputs.environment }}"
-          PRODUCT="${{ needs.check-updates.outputs.product }} ${{ needs.check-updates.outputs.product_version }}"
+          # Get values from previous job
           CURRENT_LEVEL="${{ needs.check-updates.outputs.current_level }}"
           LATEST_LEVEL="${{ needs.check-updates.outputs.latest_level }}"
+          UPDATES_AVAILABLE="${{ needs.check-updates.outputs.updates_available }}"
+          UPDATES_COUNT="${{ needs.check-updates.outputs.updates_count }}"
+          STATUS="${{ needs.check-updates.outputs.status }}"
+          HOST="${{ needs.check-updates.outputs.host }}"
+          PRODUCT="${{ needs.check-updates.outputs.product }}"
+          PRODUCT_VERSION="${{ needs.check-updates.outputs.product_version }}"
+          HAS_CONFLICTS="${{ needs.check-updates.outputs.has_conflicts }}"
+          CONFLICT_COUNT="${{ needs.check-updates.outputs.conflict_count }}"
+          CONFLICT_FILES="${{ needs.check-updates.outputs.conflict_files }}"
+          DRY_RUN_ID="${{ needs.check-updates.outputs.dry_run_id }}"
+          DRY_RUN_PATH="${{ needs.check-updates.outputs.dry_run_path }}"
           
-          PDF_FILE="/tmp/wso2_conflict_report_${ENVIRONMENT}_$(date +%Y%m%d_%H%M%S).pdf"
-          
-          python3 /tmp/generate_diff_pdf.py "$COMPARISONS_FILE" "$PDF_FILE" "$ENVIRONMENT" "$PRODUCT" "$CURRENT_LEVEL" "$LATEST_LEVEL"
-          
-          if [ -f "$PDF_FILE" ]; then
-            echo "PDF generated successfully: $PDF_FILE"
-            echo "pdf_path=$PDF_FILE" >> $GITHUB_OUTPUT
-            echo "pdf_generated=true" >> $GITHUB_OUTPUT
-            
-            # Upload as artifact
-            echo "pdf_name=$(basename $PDF_FILE)" >> $GITHUB_OUTPUT
+          # Determine theme color and title based on status
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            TITLE="🚨 WSO2 IAM Update Conflicts Detected"
+            THEME_COLOR="DC3545"
+          elif [ "$UPDATES_AVAILABLE" = "true" ]; then
+            TITLE="⚠️ WSO2 IAM Patch Updates Available"
+            THEME_COLOR="FFA500"
           else
-            echo "Failed to generate PDF"
-            echo "pdf_generated=false" >> $GITHUB_OUTPUT
+            TITLE="✅ WSO2 IAM Update Check Complete"
+            THEME_COLOR="28A745"
           fi
-
-      - name: Upload conflict report artifact
-        if: steps.generate_pdf.outputs.pdf_generated == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: wso2-conflict-report
-          path: ${{ steps.generate_pdf.outputs.pdf_path }}
-          retention-days: 30
+          
+          # Determine environment
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ENVIRONMENT="${{ env.DEFAULT_ENVIRONMENT }}"
+            TRIGGER="Scheduled (Monthly)"
+          else
+            ENVIRONMENT="${{ inputs.environment }}"
+            TRIGGER="Manual"
+          fi
+          
+          CHECK_TIME=$(TZ='Asia/Colombo' date +"%Y-%m-%d %H:%M:%S IST")
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ARTIFACT_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
+          
+          # Build base facts array
+          FACTS=$(jq -n \
+            --arg env "$ENVIRONMENT" \
+            --arg product "$PRODUCT $PRODUCT_VERSION" \
+            --arg current "v$CURRENT_LEVEL" \
+            --arg latest "v$LATEST_LEVEL" \
+            --arg count "$UPDATES_COUNT update(s)" \
+            --arg trigger "$TRIGGER (${{ github.actor }})" \
+            --arg time "$CHECK_TIME" \
+            '[
+              { "name": "🌍 Environment", "value": ("**" + $env + "**") },
+              { "name": "🖥️ Host", "value": "IAM" },
+              { "name": "📦 Product", "value": $product },
+              { "name": "📍 Current Level", "value": $current },
+              { "name": "🎯 Latest Level", "value": $latest },
+              { "name": "🔄 Updates Count", "value": $count },
+              { "name": "👤 Triggered By", "value": $trigger },
+              { "name": "🕐 Check Time", "value": $time }
+            ]')
+          
+          # Add conflict fact if needed
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            FACTS=$(echo "$FACTS" | jq --arg cc "$CONFLICT_COUNT" '. + [{ "name": "⚠️ Conflicts", "value": ("**" + $cc + " file(s) with conflicts**") }]')
+          fi
+          
+          # Add dry run ID fact if conflicts exist and we have the ID
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DRY_RUN_ID" ]; then
+            FACTS=$(echo "$FACTS" | jq --arg drid "$DRY_RUN_ID" '. + [{ "name": "🔖 Dry Run ID", "value": $drid }]')
+          fi
+          
+          # Build main section
+          MAIN_SECTION=$(jq -n \
+            --arg title "$TITLE" \
+            --argjson facts "$FACTS" \
+            '{
+              "activityTitle": $title,
+              "facts": $facts,
+              "markdown": true
+            }')
+          
+          # Build sections array starting with main section
+          SECTIONS=$(echo "[$MAIN_SECTION]")
+          
+          # Add conflict files section if needed
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$CONFLICT_FILES" ] && [ "$CONFLICT_FILES" != "None" ]; then
+            # Build conflict files as facts array for better formatting
+            CONFLICT_FACTS=$(echo "$CONFLICT_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("File " + ((.key + 1) | tostring)), "value": .value })')
+            
+            CONFLICT_SECTION=$(jq -n \
+              --argjson facts "$CONFLICT_FACTS" \
+              '{
+                "activityTitle": "📁 Conflict Files (Manual Resolution Required)",
+                "facts": $facts,
+                "markdown": true
+              }')
+            
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson cs "$CONFLICT_SECTION" '. + [$cs]')
+          fi
+          
+          # Build potential actions
+          ACTIONS=$(jq -n \
+            --arg workflow_url "$WORKFLOW_URL" \
+            --arg artifact_url "$ARTIFACT_URL" \
+            --arg has_conflicts "$HAS_CONFLICTS" \
+            'if $has_conflicts == "true" then
+              [
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 Download Conflict Report (PDF)",
+                  "targets": [{ "os": "default", "uri": $artifact_url }]
+                }
+              ]
+            else
+              [
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                }
+              ]
+            end')
+          
+          # Build final payload
+          JSON_PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg theme "$THEME_COLOR" \
+            --argjson sections "$SECTIONS" \
+            --argjson actions "$ACTIONS" \
+            '{
+              "@type": "MessageCard",
+              "@context": "http://schema.org/extensions",
+              "themeColor": $theme,
+              "summary": $title,
+              "sections": $sections,
+              "potentialAction": $actions
+            }')
+          
+          echo "JSON Payload:"
+          echo "$JSON_PAYLOAD" | jq .
+          
+          echo "Sending notification to Teams..."
+          
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --proxy "${HTTPS_PROXY:-}" \
+            --connect-timeout 30 \
+            --max-time 60 \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "$TEAMS_WEBHOOK_URL")
+          
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+          
+          echo "Response code: $HTTP_CODE"
+          echo "Response: $RESPONSE_BODY"
+          
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::warning::Teams notification failed with code $HTTP_CODE"
+          else
+            echo "Teams notification sent successfully"
+          fi
