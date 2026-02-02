@@ -1,174 +1,231 @@
-- name: Send Teams notification
-        run: |
-          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
-            echo "Teams webhook not configured, skipping"
-            exit 0
-          fi
-          
-          # Get values from previous job
-          CURRENT_LEVEL="${{ needs.check-updates.outputs.current_level }}"
-          LATEST_LEVEL="${{ needs.check-updates.outputs.latest_level }}"
-          UPDATES_AVAILABLE="${{ needs.check-updates.outputs.updates_available }}"
-          UPDATES_COUNT="${{ needs.check-updates.outputs.updates_count }}"
-          STATUS="${{ needs.check-updates.outputs.status }}"
-          HOST="${{ needs.check-updates.outputs.host }}"
-          PRODUCT="${{ needs.check-updates.outputs.product }}"
-          PRODUCT_VERSION="${{ needs.check-updates.outputs.product_version }}"
-          HAS_CONFLICTS="${{ needs.check-updates.outputs.has_conflicts }}"
-          CONFLICT_COUNT="${{ needs.check-updates.outputs.conflict_count }}"
-          CONFLICT_FILES="${{ needs.check-updates.outputs.conflict_files }}"
-          DRY_RUN_ID="${{ needs.check-updates.outputs.dry_run_id }}"
-          DRY_RUN_PATH="${{ needs.check-updates.outputs.dry_run_path }}"
-          REPORT_URL="${{ needs.check-updates.outputs.report_url }}"
-          
-          # Determine theme color and title based on status
-          if [ "$HAS_CONFLICTS" = "true" ]; then
-            TITLE="🚨 WSO2 IAM Update Conflicts Detected"
-            THEME_COLOR="DC3545"
-          elif [ "$UPDATES_AVAILABLE" = "true" ]; then
-            TITLE="⚠️ WSO2 IAM Patch Updates Available"
-            THEME_COLOR="FFA500"
-          else
-            TITLE="✅ WSO2 IAM Update Check Complete"
-            THEME_COLOR="28A745"
-          fi
-          
-          # Determine environment
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            ENVIRONMENT="${{ env.DEFAULT_ENVIRONMENT }}"
-            TRIGGER="Scheduled (Monthly)"
-          else
-            ENVIRONMENT="${{ inputs.environment }}"
-            TRIGGER="Manual"
-          fi
-          
-          CHECK_TIME=$(TZ='Asia/Colombo' date +"%Y-%m-%d %H:%M:%S IST")
-          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          
-          # Build base facts array
-          FACTS=$(jq -n \
-            --arg env "$ENVIRONMENT" \
-            --arg product "$PRODUCT $PRODUCT_VERSION" \
-            --arg current "v$CURRENT_LEVEL" \
-            --arg latest "v$LATEST_LEVEL" \
-            --arg count "$UPDATES_COUNT update(s)" \
-            --arg trigger "$TRIGGER (${{ github.actor }})" \
-            --arg time "$CHECK_TIME" \
-            '[
-              { "name": "🌍 Environment", "value": ("**" + $env + "**") },
-              { "name": "🖥️ Host", "value": "IAM" },
-              { "name": "📦 Product", "value": $product },
-              { "name": "📍 Current Level", "value": $current },
-              { "name": "🎯 Latest Level", "value": $latest },
-              { "name": "🔄 Updates Count", "value": $count },
-              { "name": "👤 Triggered By", "value": $trigger },
-              { "name": "🕐 Check Time", "value": $time }
-            ]')
-          
-          # Add conflict fact if needed
-          if [ "$HAS_CONFLICTS" = "true" ]; then
-            FACTS=$(echo "$FACTS" | jq --arg cc "$CONFLICT_COUNT" '. + [{ "name": "⚠️ Conflicts", "value": ("**" + $cc + " file(s) with conflicts**") }]')
-          fi
-          
-          # Add dry run ID fact if conflicts exist and we have the ID
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DRY_RUN_ID" ]; then
-            FACTS=$(echo "$FACTS" | jq --arg drid "$DRY_RUN_ID" '. + [{ "name": "🔖 Dry Run ID", "value": $drid }]')
-          fi
-          
-          # Build main section
-          MAIN_SECTION=$(jq -n \
-            --arg title "$TITLE" \
-            --argjson facts "$FACTS" \
-            '{
-              "activityTitle": $title,
-              "facts": $facts,
-              "markdown": true
-            }')
-          
-          # Build sections array starting with main section
-          SECTIONS=$(echo "[$MAIN_SECTION]")
-          
-          # Add conflict files section if needed
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$CONFLICT_FILES" ] && [ "$CONFLICT_FILES" != "None" ]; then
-            # Build conflict files as facts array for better formatting
-            CONFLICT_FACTS=$(echo "$CONFLICT_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("File " + ((.key + 1) | tostring)), "value": .value })')
-            
-            CONFLICT_SECTION=$(jq -n \
-              --argjson facts "$CONFLICT_FACTS" \
-              '{
-                "activityTitle": "📁 Conflict Files (Manual Resolution Required)",
-                "facts": $facts,
-                "markdown": true
-              }')
-            
-            SECTIONS=$(echo "$SECTIONS" | jq --argjson cs "$CONFLICT_SECTION" '. + [$cs]')
-          fi
-          
-          # Build potential actions with report link if available
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
-            ACTIONS=$(jq -n \
-              --arg workflow_url "$WORKFLOW_URL" \
-              --arg report_url "$REPORT_URL" \
-              '[
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                },
-                {
-                  "@type": "OpenUri",
-                  "name": "📄 View Conflict Report",
-                  "targets": [{ "os": "default", "uri": $report_url }]
-                }
-              ]')
-          else
-            ACTIONS=$(jq -n \
-              --arg workflow_url "$WORKFLOW_URL" \
-              '[
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                }
-              ]')
-          fi
-          
-          # Build final payload
-          JSON_PAYLOAD=$(jq -n \
-            --arg title "$TITLE" \
-            --arg theme "$THEME_COLOR" \
-            --argjson sections "$SECTIONS" \
-            --argjson actions "$ACTIONS" \
-            '{
-              "@type": "MessageCard",
-              "@context": "http://schema.org/extensions",
-              "themeColor": $theme,
-              "summary": $title,
-              "sections": $sections,
-              "potentialAction": $actions
-            }')
-          
-          echo "JSON Payload:"
-          echo "$JSON_PAYLOAD" | jq .
-          
-          echo "Sending notification to Teams..."
-          
-          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            --proxy "${HTTPS_PROXY:-}" \
-            --connect-timeout 30 \
-            --max-time 60 \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD" \
-            "$TEAMS_WEBHOOK_URL")
-          
-          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
-          
-          echo "Response code: $HTTP_CODE"
-          echo "Response: $RESPONSE_BODY"
-          
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::warning::Teams notification failed with code $HTTP_CODE"
-          else
-            echo "Teams notification sent successfully"
-          fi
+- name: Create HTML report generator script
+      ansible.builtin.copy:
+        dest: /tmp/generate_diff_report.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import json
+          import sys
+          import difflib
+          from datetime import datetime
+          import html
+
+          def create_diff_html(comparisons_file, output_file, environment, product, current_level, latest_level, dry_run_id):
+              with open(comparisons_file, 'r') as f:
+                  comparisons = json.load(f)
+              
+              if not comparisons:
+                  print("No comparisons to process")
+                  return False
+              
+              report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+              
+              html_content = f'''<!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>WSO2 Update Conflict Report - {html.escape(environment)}</title>
+              <style>
+                  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
+                  .container {{ max-width: 1400px; margin: 0 auto; padding: 20px; }}
+                  .header {{ background: linear-gradient(135deg, #dc3545 0%, #c82333 100%); color: white; padding: 40px; border-radius: 10px; margin-bottom: 30px; text-align: center; }}
+                  .header h1 {{ font-size: 2.2em; margin-bottom: 10px; }}
+                  .header p {{ opacity: 0.9; font-size: 1.1em; }}
+                  .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin: 30px 0; }}
+                  .info-card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                  .info-card .label {{ font-size: 0.8em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }}
+                  .info-card .value {{ font-size: 1.3em; font-weight: 600; color: #1a1a2e; margin-top: 5px; }}
+                  .legend {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                  .legend h3 {{ margin-bottom: 15px; color: #1a1a2e; }}
+                  .legend-items {{ display: flex; gap: 30px; flex-wrap: wrap; }}
+                  .legend-item {{ display: flex; align-items: center; gap: 10px; }}
+                  .legend-color {{ width: 20px; height: 20px; border-radius: 4px; }}
+                  .legend-color.added {{ background: #d4edda; border: 1px solid #28a745; }}
+                  .legend-color.removed {{ background: #f8d7da; border: 1px solid #dc3545; }}
+                  .file-section {{ background: white; border-radius: 10px; margin-bottom: 30px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+                  .file-header {{ background: #343a40; color: white; padding: 15px 20px; }}
+                  .file-header h2 {{ font-size: 1em; font-weight: 500; word-break: break-all; }}
+                  .file-number {{ background: #dc3545; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; margin-right: 10px; }}
+                  .diff-container {{ overflow-x: auto; }}
+                  .diff-table {{ width: 100%; border-collapse: collapse; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 11px; }}
+                  .diff-table tr {{ border-bottom: 1px solid #eee; }}
+                  .diff-table td {{ padding: 1px 8px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }}
+                  .diff-table .line-num {{ width: 40px; text-align: right; color: #999; background: #f8f9fa; border-right: 1px solid #dee2e6; user-select: none; }}
+                  .diff-table tr.added {{ background: #d4edda; }}
+                  .diff-table tr.added td {{ color: #155724; }}
+                  .diff-table tr.removed {{ background: #f8d7da; }}
+                  .diff-table tr.removed td {{ color: #721c24; }}
+                  .diff-table tr.header {{ background: #cce5ff; }}
+                  .diff-table tr.header td {{ color: #004085; font-weight: bold; }}
+                  .diff-table tr.range {{ background: #e2e3e5; }}
+                  .diff-table tr.range td {{ color: #383d41; }}
+                  .no-diff {{ padding: 30px; text-align: center; color: #6c757d; }}
+                  .truncated {{ padding: 10px; background: #fff3cd; color: #856404; text-align: center; }}
+                  .footer {{ text-align: center; padding: 30px; color: #6c757d; font-size: 0.9em; }}
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header">
+                      <h1>WSO2 Update Conflict Report</h1>
+                      <p>Manual resolution required for the following files</p>
+                  </div>
+                  
+                  <div class="info-grid">
+                      <div class="info-card"><div class="label">Environment</div><div class="value">{html.escape(environment)}</div></div>
+                      <div class="info-card"><div class="label">Product</div><div class="value">{html.escape(product)}</div></div>
+                      <div class="info-card"><div class="label">Current Level</div><div class="value">v{html.escape(current_level)}</div></div>
+                      <div class="info-card"><div class="label">Target Level</div><div class="value">v{html.escape(latest_level)}</div></div>
+                      <div class="info-card"><div class="label">Conflicts</div><div class="value">{len(comparisons)} files</div></div>
+                      <div class="info-card"><div class="label">Dry Run ID</div><div class="value">{html.escape(dry_run_id)}</div></div>
+                      <div class="info-card"><div class="label">Generated</div><div class="value" style="font-size:1em">{report_time}</div></div>
+                  </div>
+                  
+                  <div class="legend">
+                      <h3>Legend</h3>
+                      <div class="legend-items">
+                          <div class="legend-item"><div class="legend-color added"></div><span>Added in new version</span></div>
+                          <div class="legend-item"><div class="legend-color removed"></div><span>Removed from your version</span></div>
+                      </div>
+                  </div>
+          '''
+              
+              for idx, comp in enumerate(comparisons, 1):
+                  filename = comp.get('filename', 'Unknown file')
+                  original_content = comp.get('original_content', '')
+                  new_content = comp.get('new_content', '')
+                  
+                  html_content += f'''
+                  <div class="file-section">
+                      <div class="file-header">
+                          <h2><span class="file-number">File {idx}</span>{html.escape(filename)}</h2>
+                      </div>
+                      <div class="diff-container">
+          '''
+                  
+                  diff = list(difflib.unified_diff(
+                      original_content.splitlines(keepends=True),
+                      new_content.splitlines(keepends=True),
+                      fromfile='Original (Your Version)',
+                      tofile='New (Update Version)',
+                      lineterm=''
+                  ))
+                  
+                  if not diff:
+                      html_content += '<div class="no-diff">No differences found in this file.</div>'
+                  else:
+                      html_content += '<table class="diff-table">'
+                      max_lines = 1500
+                      for i, line in enumerate(diff[:max_lines], 1):
+                          line_escaped = html.escape(line.rstrip('\n\r'))
+                          if line.startswith('+++') or line.startswith('---'):
+                              cls = 'header'
+                          elif line.startswith('@@'):
+                              cls = 'range'
+                          elif line.startswith('+'):
+                              cls = 'added'
+                          elif line.startswith('-'):
+                              cls = 'removed'
+                          else:
+                              cls = ''
+                          html_content += f'<tr class="{cls}"><td class="line-num">{i}</td><td>{line_escaped}</td></tr>'
+                      
+                      if len(diff) > max_lines:
+                          html_content += f'</table><div class="truncated">Truncated: {len(diff) - max_lines} more lines</div>'
+                      else:
+                          html_content += '</table>'
+                  
+                  html_content += '</div></div>'
+              
+              html_content += '''
+                  <div class="footer">
+                      <p>Generated by WSO2 Update Check Workflow</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          '''
+              
+              with open(output_file, 'w', encoding='utf-8') as f:
+                  f.write(html_content)
+              
+              print(f"Report generated: {output_file}")
+              return True
+
+          if __name__ == "__main__":
+              if len(sys.argv) < 3:
+                  print("Usage: generate_diff_report.py <comparisons_file> <output_file> [environment] [product] [current_level] [latest_level] [dry_run_id]")
+                  sys.exit(1)
+              
+              success = create_diff_html(
+                  sys.argv[1],
+                  sys.argv[2],
+                  sys.argv[3] if len(sys.argv) > 3 else "Unknown",
+                  sys.argv[4] if len(sys.argv) > 4 else "WSO2",
+                  sys.argv[5] if len(sys.argv) > 5 else "Unknown",
+                  sys.argv[6] if len(sys.argv) > 6 else "Unknown",
+                  sys.argv[7] if len(sys.argv) > 7 else "Unknown"
+              )
+              sys.exit(0 if success else 1)
+      delegate_to: localhost
+      become: false
+      when:
+        - has_conflicts | bool
+        - conflict_comparisons is defined
+        - conflict_comparisons | length > 0
+
+    - name: Generate HTML report on localhost
+      ansible.builtin.command:
+        cmd: >
+          python3 /tmp/generate_diff_report.py
+          "/tmp/wso2_conflict_comparisons_{{ inventory_hostname }}.json"
+          "/tmp/wso2_conflict_report_{{ inventory_hostname }}.html"
+          "{{ environment_name | default('Unknown') }}"
+          "{{ wso2_product | default('wso2is') }} {{ wso2_version | default('5.11.0') }}"
+          "{{ current_update_level }}"
+          "{{ latest_available_level }}"
+          "{{ dry_run_id }}"
+      delegate_to: localhost
+      become: false
+      when:
+        - has_conflicts | bool
+        - conflict_comparisons is defined
+        - conflict_comparisons | length > 0
+      register: html_report_generation
+
+    - name: Create reports directory on WSO2 server
+      ansible.builtin.file:
+        path: "/opt/wso2-reports"
+        state: directory
+        mode: '0755'
+      when:
+        - has_conflicts | bool
+        - html_report_generation is defined
+        - html_report_generation.rc == 0
+
+    - name: Copy HTML report to WSO2 server
+      ansible.builtin.copy:
+        src: "/tmp/wso2_conflict_report_{{ inventory_hostname }}.html"
+        dest: "/opt/wso2-reports/conflict_report_{{ dry_run_id }}.html"
+        mode: '0644'
+      when:
+        - has_conflicts | bool
+        - html_report_generation is defined
+        - html_report_generation.rc == 0
+
+    - name: Set report URL fact
+      ansible.builtin.set_fact:
+        report_url: "http://{{ ansible_host }}:8090/conflict_report_{{ dry_run_id }}.html"
+      when:
+        - has_conflicts | bool
+        - html_report_generation is defined
+        - html_report_generation.rc == 0
+
+    - name: Display report URL
+      ansible.builtin.debug:
+        msg: "Conflict report available at: {{ report_url }}"
+      when:
+        - has_conflicts | bool
+        - report_url is defined
