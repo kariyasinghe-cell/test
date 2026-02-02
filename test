@@ -1,193 +1,107 @@
-notify-teams:
-    name: Send Teams Notification
-    runs-on: ubuntu-latest
-    needs: check-updates
-    if: always()
-    env:
-      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-    steps:
-      - name: Install jq
-        run: |
-          INSTALL_DIR="/tmp/bin"
-          mkdir -p "$INSTALL_DIR"
-          
-          if [ ! -x "$INSTALL_DIR/jq" ]; then
-            curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$INSTALL_DIR/jq"
-            chmod +x "$INSTALL_DIR/jq"
-          fi
-          
-          echo "$INSTALL_DIR" >> $GITHUB_PATH
+    - name: Debug has_conflicts value
+      ansible.builtin.debug:
+        msg: "has_conflicts = {{ has_conflicts }}, dry_run_path = {{ dry_run_path }}"
 
-      - name: Send Teams notification
-        run: |
-          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
-            echo "Teams webhook not configured, skipping"
-            exit 0
-          fi
-          
-          # Get values from previous job
-          CURRENT_LEVEL="${{ needs.check-updates.outputs.current_level }}"
-          LATEST_LEVEL="${{ needs.check-updates.outputs.latest_level }}"
-          UPDATES_AVAILABLE="${{ needs.check-updates.outputs.updates_available }}"
-          UPDATES_COUNT="${{ needs.check-updates.outputs.updates_count }}"
-          STATUS="${{ needs.check-updates.outputs.status }}"
-          HOST="${{ needs.check-updates.outputs.host }}"
-          PRODUCT="${{ needs.check-updates.outputs.product }}"
-          PRODUCT_VERSION="${{ needs.check-updates.outputs.product_version }}"
-          HAS_CONFLICTS="${{ needs.check-updates.outputs.has_conflicts }}"
-          CONFLICT_COUNT="${{ needs.check-updates.outputs.conflict_count }}"
-          CONFLICT_FILES="${{ needs.check-updates.outputs.conflict_files }}"
-          DRY_RUN_ID="${{ needs.check-updates.outputs.dry_run_id }}"
-          DRY_RUN_PATH="${{ needs.check-updates.outputs.dry_run_path }}"
-          
-          # Determine theme color and title based on status
-          if [ "$HAS_CONFLICTS" = "true" ]; then
-            TITLE="🚨 WSO2 IAM Update Conflicts Detected"
-            THEME_COLOR="DC3545"
-          elif [ "$UPDATES_AVAILABLE" = "true" ]; then
-            TITLE="⚠️ WSO2 IAM Patch Updates Available"
-            THEME_COLOR="FFA500"
-          else
-            TITLE="✅ WSO2 IAM Update Check Complete"
-            THEME_COLOR="28A745"
-          fi
-          
-          # Determine environment
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            ENVIRONMENT="${{ env.DEFAULT_ENVIRONMENT }}"
-            TRIGGER="Scheduled (Monthly)"
-          else
-            ENVIRONMENT="${{ inputs.environment }}"
-            TRIGGER="Manual"
-          fi
-          
-          CHECK_TIME=$(TZ='Asia/Colombo' date +"%Y-%m-%d %H:%M:%S IST")
-          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          ARTIFACT_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
-          
-          # Build base facts array
-          FACTS=$(jq -n \
-            --arg env "$ENVIRONMENT" \
-            --arg product "$PRODUCT $PRODUCT_VERSION" \
-            --arg current "v$CURRENT_LEVEL" \
-            --arg latest "v$LATEST_LEVEL" \
-            --arg count "$UPDATES_COUNT update(s)" \
-            --arg trigger "$TRIGGER (${{ github.actor }})" \
-            --arg time "$CHECK_TIME" \
-            '[
-              { "name": "🌍 Environment", "value": ("**" + $env + "**") },
-              { "name": "🖥️ Host", "value": "IAM" },
-              { "name": "📦 Product", "value": $product },
-              { "name": "📍 Current Level", "value": $current },
-              { "name": "🎯 Latest Level", "value": $latest },
-              { "name": "🔄 Updates Count", "value": $count },
-              { "name": "👤 Triggered By", "value": $trigger },
-              { "name": "🕐 Check Time", "value": $time }
-            ]')
-          
-          # Add conflict fact if needed
-          if [ "$HAS_CONFLICTS" = "true" ]; then
-            FACTS=$(echo "$FACTS" | jq --arg cc "$CONFLICT_COUNT" '. + [{ "name": "⚠️ Conflicts", "value": ("**" + $cc + " file(s) with conflicts**") }]')
-          fi
-          
-          # Add dry run ID fact if conflicts exist and we have the ID
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DRY_RUN_ID" ]; then
-            FACTS=$(echo "$FACTS" | jq --arg drid "$DRY_RUN_ID" '. + [{ "name": "🔖 Dry Run ID", "value": $drid }]')
-          fi
-          
-          # Build main section
-          MAIN_SECTION=$(jq -n \
-            --arg title "$TITLE" \
-            --argjson facts "$FACTS" \
-            '{
-              "activityTitle": $title,
-              "facts": $facts,
-              "markdown": true
-            }')
-          
-          # Build sections array starting with main section
-          SECTIONS=$(echo "[$MAIN_SECTION]")
-          
-          # Add conflict files section if needed
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$CONFLICT_FILES" ] && [ "$CONFLICT_FILES" != "None" ]; then
-            # Build conflict files as facts array for better formatting
-            CONFLICT_FACTS=$(echo "$CONFLICT_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("File " + ((.key + 1) | tostring)), "value": .value })')
-            
-            CONFLICT_SECTION=$(jq -n \
-              --argjson facts "$CONFLICT_FACTS" \
-              '{
-                "activityTitle": "📁 Conflict Files (Manual Resolution Required)",
-                "facts": $facts,
-                "markdown": true
-              }')
-            
-            SECTIONS=$(echo "$SECTIONS" | jq --argjson cs "$CONFLICT_SECTION" '. + [$cs]')
-          fi
-          
-          # Build potential actions
-          ACTIONS=$(jq -n \
-            --arg workflow_url "$WORKFLOW_URL" \
-            --arg artifact_url "$ARTIFACT_URL" \
-            --arg has_conflicts "$HAS_CONFLICTS" \
-            'if $has_conflicts == "true" then
-              [
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                },
-                {
-                  "@type": "OpenUri",
-                  "name": "📄 Download Conflict Report (PDF)",
-                  "targets": [{ "os": "default", "uri": $artifact_url }]
-                }
-              ]
-            else
-              [
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                }
-              ]
-            end')
-          
-          # Build final payload
-          JSON_PAYLOAD=$(jq -n \
-            --arg title "$TITLE" \
-            --arg theme "$THEME_COLOR" \
-            --argjson sections "$SECTIONS" \
-            --argjson actions "$ACTIONS" \
-            '{
-              "@type": "MessageCard",
-              "@context": "http://schema.org/extensions",
-              "themeColor": $theme,
-              "summary": $title,
-              "sections": $sections,
-              "potentialAction": $actions
-            }')
-          
-          echo "JSON Payload:"
-          echo "$JSON_PAYLOAD" | jq .
-          
-          echo "Sending notification to Teams..."
-          
-          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
-            --proxy "${HTTPS_PROXY:-}" \
-            --connect-timeout 30 \
-            --max-time 60 \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD" \
-            "$TEAMS_WEBHOOK_URL")
-          
-          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
-          RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
-          
-          echo "Response code: $HTTP_CODE"
-          echo "Response: $RESPONSE_BODY"
-          
-          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-            echo "::warning::Teams notification failed with code $HTTP_CODE"
-          else
-            echo "Teams notification sent successfully"
-          fi
+    - name: Set conflicts.json path
+      ansible.builtin.set_fact:
+        conflicts_json_path: "{{ dry_run_path }}/updates/conflicts.json"
+      when: has_conflicts | bool
+
+    - name: Check if conflicts.json exists
+      ansible.builtin.stat:
+        path: "{{ conflicts_json_path }}"
+      register: conflicts_json_stat
+      when: has_conflicts | bool
+
+    - name: Display conflicts.json check result
+      ansible.builtin.debug:
+        msg: "Conflicts.json exists: {{ conflicts_json_stat.stat.exists | default(false) }} at {{ conflicts_json_path }}"
+      when: has_conflicts | bool
+
+    - name: Read conflicts.json from remote server
+      ansible.builtin.slurp:
+        src: "{{ conflicts_json_path }}"
+      register: conflicts_json_content
+      when: 
+        - has_conflicts | bool
+        - conflicts_json_stat.stat.exists | default(false)
+
+    - name: Parse conflicts.json
+      ansible.builtin.set_fact:
+        conflicts_data: "{{ conflicts_json_content.content | b64decode | from_json }}"
+      when:
+        - has_conflicts | bool
+        - conflicts_json_content is defined
+        - conflicts_json_content.content is defined
+
+    - name: Display conflicts data
+      ansible.builtin.debug:
+        msg: "Found {{ conflicts_data | length }} conflict entries: {{ conflicts_data }}"
+      when:
+        - has_conflicts | bool
+        - conflicts_data is defined
+
+    - name: Fetch original file contents
+      ansible.builtin.slurp:
+        src: "{{ item.original }}"
+      register: original_files
+      loop: "{{ conflicts_data | default([]) }}"
+      loop_control:
+        label: "{{ item.original | basename }}"
+      when:
+        - has_conflicts | bool
+        - conflicts_data is defined
+        - conflicts_data | length > 0
+      failed_when: false
+
+    - name: Fetch new file contents
+      ansible.builtin.slurp:
+        src: "{{ item.new }}"
+      register: new_files
+      loop: "{{ conflicts_data | default([]) }}"
+      loop_control:
+        label: "{{ item.new | basename }}"
+      when:
+        - has_conflicts | bool
+        - conflicts_data is defined
+        - conflicts_data | length > 0
+      failed_when: false
+
+    - name: Build conflict comparisons data
+      ansible.builtin.set_fact:
+        conflict_comparisons: "{{ conflict_comparisons | default([]) + [comparison_item] }}"
+      vars:
+        comparison_item:
+          filename: "{{ original_files.results[my_idx].item.original | regex_replace('.*dry-run/[^/]+/', '') | regex_replace('\\.original$', '') }}"
+          original_path: "{{ original_files.results[my_idx].item.original }}"
+          new_path: "{{ original_files.results[my_idx].item.new }}"
+          original_content: "{{ original_files.results[my_idx].content | default('') | b64decode }}"
+          new_content: "{{ new_files.results[my_idx].content | default('') | b64decode }}"
+      loop: "{{ conflicts_data | default([]) }}"
+      loop_control:
+        index_var: my_idx
+        label: "Building comparison {{ my_idx + 1 }}"
+      when:
+        - has_conflicts | bool
+        - original_files is defined
+        - original_files.results is defined
+        - new_files is defined
+        - new_files.results is defined
+        - original_files.results | length > 0
+
+    - name: Display conflict comparisons summary
+      ansible.builtin.debug:
+        msg: "Built {{ conflict_comparisons | default([]) | length }} conflict comparisons"
+      when: has_conflicts | bool
+
+    - name: Save conflict comparisons to JSON file
+      ansible.builtin.copy:
+        content: "{{ conflict_comparisons | default([]) | to_nice_json }}"
+        dest: "/tmp/wso2_conflict_comparisons_{{ inventory_hostname }}.json"
+        mode: '0644'
+      delegate_to: localhost
+      become: false
+      when:
+        - has_conflicts | bool
+        - conflict_comparisons is defined
+        - conflict_comparisons | length > 0
