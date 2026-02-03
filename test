@@ -1,231 +1,253 @@
-- name: Create HTML report generator script
-      ansible.builtin.copy:
-        dest: /tmp/generate_diff_report.py
-        mode: '0755'
-        content: |
-          #!/usr/bin/env python3
-          import json
-          import sys
-          import difflib
-          from datetime import datetime
-          import html
+Here's the updated step to upload the HTML report to a GitHub Release:
 
-          def create_diff_html(comparisons_file, output_file, environment, product, current_level, latest_level, dry_run_id):
-              with open(comparisons_file, 'r') as f:
-                  comparisons = json.load(f)
-              
-              if not comparisons:
-                  print("No comparisons to process")
-                  return False
-              
-              report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-              
-              html_content = f'''<!DOCTYPE html>
-          <html lang="en">
-          <head>
-              <meta charset="UTF-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1.0">
-              <title>WSO2 Update Conflict Report - {html.escape(environment)}</title>
-              <style>
-                  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-                  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
-                  .container {{ max-width: 1400px; margin: 0 auto; padding: 20px; }}
-                  .header {{ background: linear-gradient(135deg, #dc3545 0%, #c82333 100%); color: white; padding: 40px; border-radius: 10px; margin-bottom: 30px; text-align: center; }}
-                  .header h1 {{ font-size: 2.2em; margin-bottom: 10px; }}
-                  .header p {{ opacity: 0.9; font-size: 1.1em; }}
-                  .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin: 30px 0; }}
-                  .info-card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                  .info-card .label {{ font-size: 0.8em; color: #666; text-transform: uppercase; letter-spacing: 0.5px; }}
-                  .info-card .value {{ font-size: 1.3em; font-weight: 600; color: #1a1a2e; margin-top: 5px; }}
-                  .legend {{ background: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-                  .legend h3 {{ margin-bottom: 15px; color: #1a1a2e; }}
-                  .legend-items {{ display: flex; gap: 30px; flex-wrap: wrap; }}
-                  .legend-item {{ display: flex; align-items: center; gap: 10px; }}
-                  .legend-color {{ width: 20px; height: 20px; border-radius: 4px; }}
-                  .legend-color.added {{ background: #d4edda; border: 1px solid #28a745; }}
-                  .legend-color.removed {{ background: #f8d7da; border: 1px solid #dc3545; }}
-                  .file-section {{ background: white; border-radius: 10px; margin-bottom: 30px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
-                  .file-header {{ background: #343a40; color: white; padding: 15px 20px; }}
-                  .file-header h2 {{ font-size: 1em; font-weight: 500; word-break: break-all; }}
-                  .file-number {{ background: #dc3545; padding: 3px 10px; border-radius: 12px; font-size: 0.85em; margin-right: 10px; }}
-                  .diff-container {{ overflow-x: auto; }}
-                  .diff-table {{ width: 100%; border-collapse: collapse; font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace; font-size: 11px; }}
-                  .diff-table tr {{ border-bottom: 1px solid #eee; }}
-                  .diff-table td {{ padding: 1px 8px; white-space: pre-wrap; word-break: break-all; vertical-align: top; }}
-                  .diff-table .line-num {{ width: 40px; text-align: right; color: #999; background: #f8f9fa; border-right: 1px solid #dee2e6; user-select: none; }}
-                  .diff-table tr.added {{ background: #d4edda; }}
-                  .diff-table tr.added td {{ color: #155724; }}
-                  .diff-table tr.removed {{ background: #f8d7da; }}
-                  .diff-table tr.removed td {{ color: #721c24; }}
-                  .diff-table tr.header {{ background: #cce5ff; }}
-                  .diff-table tr.header td {{ color: #004085; font-weight: bold; }}
-                  .diff-table tr.range {{ background: #e2e3e5; }}
-                  .diff-table tr.range td {{ color: #383d41; }}
-                  .no-diff {{ padding: 30px; text-align: center; color: #6c757d; }}
-                  .truncated {{ padding: 10px; background: #fff3cd; color: #856404; text-align: center; }}
-                  .footer {{ text-align: center; padding: 30px; color: #6c757d; font-size: 0.9em; }}
-              </style>
-          </head>
-          <body>
-              <div class="container">
-                  <div class="header">
-                      <h1>WSO2 Update Conflict Report</h1>
-                      <p>Manual resolution required for the following files</p>
-                  </div>
-                  
-                  <div class="info-grid">
-                      <div class="info-card"><div class="label">Environment</div><div class="value">{html.escape(environment)}</div></div>
-                      <div class="info-card"><div class="label">Product</div><div class="value">{html.escape(product)}</div></div>
-                      <div class="info-card"><div class="label">Current Level</div><div class="value">v{html.escape(current_level)}</div></div>
-                      <div class="info-card"><div class="label">Target Level</div><div class="value">v{html.escape(latest_level)}</div></div>
-                      <div class="info-card"><div class="label">Conflicts</div><div class="value">{len(comparisons)} files</div></div>
-                      <div class="info-card"><div class="label">Dry Run ID</div><div class="value">{html.escape(dry_run_id)}</div></div>
-                      <div class="info-card"><div class="label">Generated</div><div class="value" style="font-size:1em">{report_time}</div></div>
-                  </div>
-                  
-                  <div class="legend">
-                      <h3>Legend</h3>
-                      <div class="legend-items">
-                          <div class="legend-item"><div class="legend-color added"></div><span>Added in new version</span></div>
-                          <div class="legend-item"><div class="legend-color removed"></div><span>Removed from your version</span></div>
-                      </div>
-                  </div>
-          '''
-              
-              for idx, comp in enumerate(comparisons, 1):
-                  filename = comp.get('filename', 'Unknown file')
-                  original_content = comp.get('original_content', '')
-                  new_content = comp.get('new_content', '')
-                  
-                  html_content += f'''
-                  <div class="file-section">
-                      <div class="file-header">
-                          <h2><span class="file-number">File {idx}</span>{html.escape(filename)}</h2>
-                      </div>
-                      <div class="diff-container">
-          '''
-                  
-                  diff = list(difflib.unified_diff(
-                      original_content.splitlines(keepends=True),
-                      new_content.splitlines(keepends=True),
-                      fromfile='Original (Your Version)',
-                      tofile='New (Update Version)',
-                      lineterm=''
-                  ))
-                  
-                  if not diff:
-                      html_content += '<div class="no-diff">No differences found in this file.</div>'
-                  else:
-                      html_content += '<table class="diff-table">'
-                      max_lines = 1500
-                      for i, line in enumerate(diff[:max_lines], 1):
-                          line_escaped = html.escape(line.rstrip('\n\r'))
-                          if line.startswith('+++') or line.startswith('---'):
-                              cls = 'header'
-                          elif line.startswith('@@'):
-                              cls = 'range'
-                          elif line.startswith('+'):
-                              cls = 'added'
-                          elif line.startswith('-'):
-                              cls = 'removed'
-                          else:
-                              cls = ''
-                          html_content += f'<tr class="{cls}"><td class="line-num">{i}</td><td>{line_escaped}</td></tr>'
-                      
-                      if len(diff) > max_lines:
-                          html_content += f'</table><div class="truncated">Truncated: {len(diff) - max_lines} more lines</div>'
-                      else:
-                          html_content += '</table>'
-                  
-                  html_content += '</div></div>'
-              
-              html_content += '''
-                  <div class="footer">
-                      <p>Generated by WSO2 Update Check Workflow</p>
-                  </div>
-              </div>
-          </body>
-          </html>
-          '''
-              
-              with open(output_file, 'w', encoding='utf-8') as f:
-                  f.write(html_content)
-              
-              print(f"Report generated: {output_file}")
-              return True
+```yaml
+      - name: Upload conflict report to GitHub Release
+        id: upload_artifact
+        if: steps.generate_report.outputs.report_generated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HTTPS_PROXY: 'http://192.168.5.60:8080'
+          HTTP_PROXY: 'http://192.168.5.60:8080'
+        run: |
+          REPORT_FILE="${{ steps.generate_report.outputs.report_path }}"
+          REPORT_NAME="${{ steps.generate_report.outputs.report_name }}"
+          DRY_RUN_ID="${{ steps.parse_report.outputs.dry_run_id }}"
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "Report file not found: $REPORT_FILE"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Report file: $REPORT_FILE"
+          echo "Report name: $REPORT_NAME"
+          echo "File size: $(stat -c%s "$REPORT_FILE") bytes"
+          
+          # Create release tag based on environment and timestamp
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="wso2-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
+          RELEASE_TITLE="WSO2 Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
+          
+          # Create release notes
+          RELEASE_NOTES="## WSO2 Update Conflict Report
+          
+          **Environment:** ${ENVIRONMENT}
+          **Dry Run ID:** ${DRY_RUN_ID}
+          **Generated:** $(date '+%Y-%m-%d %H:%M:%S')
+          **Workflow Run:** [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ### Conflicts Detected
+          - **Current Level:** v${{ steps.parse_report.outputs.current_level }}
+          - **Target Level:** v${{ steps.parse_report.outputs.latest_level }}
+          - **Conflict Count:** ${{ steps.parse_report.outputs.conflict_count }} file(s)
+          
+          ### Download
+          Download the HTML report below to view the detailed diff comparison of conflicting files."
+          
+          echo "Creating release with tag: $TAG"
+          
+          # Check if gh CLI is available
+          if ! command -v gh &> /dev/null; then
+            echo "GitHub CLI (gh) not found. Installing..."
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+          fi
+          
+          # Create release and upload file
+          echo "Creating GitHub release: $TAG"
+          if gh release create "$TAG" \
+            --title "$RELEASE_TITLE" \
+            --notes "$RELEASE_NOTES" \
+            "$REPORT_FILE#${REPORT_NAME}"; then
+            
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+            DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${REPORT_NAME}"
+            
+            echo "Release created successfully!"
+            echo "Release URL: $RELEASE_URL"
+            echo "Download URL: $DOWNLOAD_URL"
+            
+            echo "uploaded=true" >> $GITHUB_OUTPUT
+            echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+            echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+            echo "report_name=$REPORT_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "Failed to create release"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+          fi
+```
 
-          if __name__ == "__main__":
-              if len(sys.argv) < 3:
-                  print("Usage: generate_diff_report.py <comparisons_file> <output_file> [environment] [product] [current_level] [latest_level] [dry_run_id]")
-                  sys.exit(1)
-              
-              success = create_diff_html(
-                  sys.argv[1],
-                  sys.argv[2],
-                  sys.argv[3] if len(sys.argv) > 3 else "Unknown",
-                  sys.argv[4] if len(sys.argv) > 4 else "WSO2",
-                  sys.argv[5] if len(sys.argv) > 5 else "Unknown",
-                  sys.argv[6] if len(sys.argv) > 6 else "Unknown",
-                  sys.argv[7] if len(sys.argv) > 7 else "Unknown"
-              )
-              sys.exit(0 if success else 1)
-      delegate_to: localhost
-      become: false
-      when:
-        - has_conflicts | bool
-        - conflict_comparisons is defined
-        - conflict_comparisons | length > 0
+Then update your job outputs to include the new release URLs:
 
-    - name: Generate HTML report on localhost
-      ansible.builtin.command:
-        cmd: >
-          python3 /tmp/generate_diff_report.py
-          "/tmp/wso2_conflict_comparisons_{{ inventory_hostname }}.json"
-          "/tmp/wso2_conflict_report_{{ inventory_hostname }}.html"
-          "{{ environment_name | default('Unknown') }}"
-          "{{ wso2_product | default('wso2is') }} {{ wso2_version | default('5.11.0') }}"
-          "{{ current_update_level }}"
-          "{{ latest_available_level }}"
-          "{{ dry_run_id }}"
-      delegate_to: localhost
-      become: false
-      when:
-        - has_conflicts | bool
-        - conflict_comparisons is defined
-        - conflict_comparisons | length > 0
-      register: html_report_generation
+```yaml
+    outputs:
+      # ... existing outputs ...
+      release_url: ${{ steps.upload_artifact.outputs.release_url }}
+      download_url: ${{ steps.upload_artifact.outputs.download_url }}
+```
 
-    - name: Create reports directory on WSO2 server
-      ansible.builtin.file:
-        path: "/opt/wso2-reports"
-        state: directory
-        mode: '0755'
-      when:
-        - has_conflicts | bool
-        - html_report_generation is defined
-        - html_report_generation.rc == 0
+And update the Teams notification to use the download URL for the button:
 
-    - name: Copy HTML report to WSO2 server
-      ansible.builtin.copy:
-        src: "/tmp/wso2_conflict_report_{{ inventory_hostname }}.html"
-        dest: "/opt/wso2-reports/conflict_report_{{ dry_run_id }}.html"
-        mode: '0644'
-      when:
-        - has_conflicts | bool
-        - html_report_generation is defined
-        - html_report_generation.rc == 0
+```yaml
+      - name: Send Teams notification
+        run: |
+          # ... existing code ...
+          
+          REPORT_URL="${{ needs.check-updates.outputs.report_url }}"
+          DOWNLOAD_URL="${{ needs.check-updates.outputs.download_url }}"
+          RELEASE_URL="${{ needs.check-updates.outputs.release_url }}"
+          
+          # ... existing code ...
+          
+          # Build potential actions with report link if available
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DOWNLOAD_URL" ]; then
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              --arg download_url "$DOWNLOAD_URL" \
+              --arg release_url "$RELEASE_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 Download Conflict Report",
+                  "targets": [{ "os": "default", "uri": $download_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📦 View Release",
+                  "targets": [{ "os": "default", "uri": $release_url }]
+                }
+              ]')
+          elif [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
+            # Fallback to nginx-hosted report if release upload failed
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              --arg report_url "$REPORT_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 View Conflict Report",
+                  "targets": [{ "os": "default", "uri": $report_url }]
+                }
+              ]')
+          else
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                }
+              ]')
+          fi
+          
+          # ... rest of notification code ...
+```
 
-    - name: Set report URL fact
-      ansible.builtin.set_fact:
-        report_url: "http://{{ ansible_host }}:8090/conflict_report_{{ dry_run_id }}.html"
-      when:
-        - has_conflicts | bool
-        - html_report_generation is defined
-        - html_report_generation.rc == 0
+If your self-hosted runner doesn't have `gh` CLI installed and you can't install it, here's an alternative using `curl` directly:
 
-    - name: Display report URL
-      ansible.builtin.debug:
-        msg: "Conflict report available at: {{ report_url }}"
-      when:
-        - has_conflicts | bool
-        - report_url is defined
+```yaml
+      - name: Upload conflict report to GitHub Release
+        id: upload_artifact
+        if: steps.generate_report.outputs.report_generated == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HTTPS_PROXY: 'http://192.168.5.60:8080'
+          HTTP_PROXY: 'http://192.168.5.60:8080'
+        run: |
+          REPORT_FILE="${{ steps.generate_report.outputs.report_path }}"
+          REPORT_NAME="${{ steps.generate_report.outputs.report_name }}"
+          DRY_RUN_ID="${{ steps.parse_report.outputs.dry_run_id }}"
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "Report file not found: $REPORT_FILE"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Report file: $REPORT_FILE"
+          echo "Report name: $REPORT_NAME"
+          echo "File size: $(stat -c%s "$REPORT_FILE") bytes"
+          
+          # Create release tag
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="wso2-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
+          RELEASE_TITLE="WSO2 Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
+          
+          RELEASE_NOTES="WSO2 Update Conflict Report\n\nEnvironment: ${ENVIRONMENT}\nDry Run ID: ${DRY_RUN_ID}\nCurrent Level: v${{ steps.parse_report.outputs.current_level }}\nTarget Level: v${{ steps.parse_report.outputs.latest_level }}\nConflict Count: ${{ steps.parse_report.outputs.conflict_count }} file(s)"
+          
+          REPO="${{ github.repository }}"
+          API_URL="https://api.github.com/repos/${REPO}/releases"
+          
+          echo "Creating release: $TAG"
+          
+          # Create release
+          CREATE_RESPONSE=$(curl -s -X POST \
+            --proxy "${HTTPS_PROXY}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL" \
+            -d "{\"tag_name\":\"$TAG\",\"name\":\"$RELEASE_TITLE\",\"body\":\"$RELEASE_NOTES\",\"draft\":false,\"prerelease\":false}")
+          
+          echo "Create response: $CREATE_RESPONSE"
+          
+          RELEASE_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+          UPLOAD_URL=$(echo "$CREATE_RESPONSE" | jq -r '.upload_url' | sed 's/{?name,label}//')
+          
+          if [ -z "$RELEASE_ID" ] || [ "$RELEASE_ID" = "null" ]; then
+            echo "Failed to create release"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Release ID: $RELEASE_ID"
+          echo "Upload URL: $UPLOAD_URL"
+          
+          # Upload asset
+          echo "Uploading report..."
+          UPLOAD_RESPONSE=$(curl -s -X POST \
+            --proxy "${HTTPS_PROXY}" \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: text/html" \
+            --data-binary @"$REPORT_FILE" \
+            "${UPLOAD_URL}?name=${REPORT_NAME}")
+          
+          echo "Upload response: $UPLOAD_RESPONSE"
+          
+          ASSET_URL=$(echo "$UPLOAD_RESPONSE" | jq -r '.browser_download_url')
+          
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "Failed to upload asset"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          RELEASE_URL="https://github.com/${REPO}/releases/tag/${TAG}"
+          
+          echo "Upload successful!"
+          echo "Release URL: $RELEASE_URL"
+          echo "Download URL: $ASSET_URL"
+          
+          echo "uploaded=true" >> $GITHUB_OUTPUT
+          echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          echo "download_url=$ASSET_URL" >> $GITHUB_OUTPUT
+          echo "report_name=$REPORT_NAME" >> $GITHUB_OUTPUT
+```
+
+This curl-based approach doesn't require `gh` CLI and works directly with the GitHub API through your proxy.
