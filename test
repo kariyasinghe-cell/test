@@ -1,1 +1,236 @@
-https://codefresh.io/blog/applied-gitops-with-kustomize/#:~:text=Approach%20%232%3A%20Deploying%20using%20Kustomize%20with%20GitOps
+Here's a comprehensive breakdown of all changes needed, organized by the workflow steps they affect.
+
+Changes Required
+1. Upload Step — Attach PDF to the GitHub Release
+In the upload_artifact step, update the gh release create command to include the PDF file:
+bash      - name: Upload conflict report to GitHub Release
+        id: upload_artifact
+        if: steps.generate_report.outputs.report_generated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HTTPS_PROXY: 'http://*.*.*.*:8080'
+          HTTP_PROXY: 'http://*.*.*.*:8080'
+        run: |
+          REPORT_FILE="${{ steps.generate_report.outputs.report_path }}"
+          REPORT_NAME="${{ steps.generate_report.outputs.report_name }}"
+          PDF_FILE="${{ steps.generate_report.outputs.pdf_report_path }}"
+          PDF_NAME="${{ steps.generate_report.outputs.pdf_report_name }}"
+          DRY_RUN_ID="${{ steps.parse_report.outputs.dry_run_id }}"
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+         
+          if [ ! -f "$REPORT_FILE" ]; then
+            echo "Report file not found: $REPORT_FILE"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+         
+          echo "Report file: $REPORT_FILE"
+          echo "Report name: $REPORT_NAME"
+          echo "File size: $(stat -c%s "$REPORT_FILE") bytes"
+
+          # Check if PDF exists
+          if [ -f "$PDF_FILE" ]; then
+            echo "PDF file: $PDF_FILE"
+            echo "PDF name: $PDF_NAME"
+            echo "PDF size: $(stat -c%s "$PDF_FILE") bytes"
+            PDF_EXISTS=true
+          else
+            echo "PDF file not found, skipping PDF upload"
+            PDF_EXISTS=false
+          fi
+         
+          # Create release tag based on environment and timestamp
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          TAG="wso2-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
+          RELEASE_TITLE="WSO2 Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
+         
+          # Create release notes
+          RELEASE_NOTES="## WSO2 Update Conflict Report
+         
+          **Environment:** ${ENVIRONMENT}
+          **Dry Run ID:** ${DRY_RUN_ID}
+          **Generated:** $(date '+%Y-%m-%d %H:%M:%S')
+          **Workflow Run:** [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+         
+          ### Conflicts Detected
+          - **Current Level:** v${{ steps.parse_report.outputs.current_level }}
+          - **Target Level:** v${{ steps.parse_report.outputs.latest_level }}
+          - **Conflict Count:** ${{ steps.parse_report.outputs.conflict_count }} file(s)
+         
+          ### Download
+          Download the HTML or PDF report below to view the detailed diff comparison of conflicting files."
+         
+          echo "Creating release with tag: $TAG"
+         
+          # Build the gh release create command with conditional PDF attachment
+          echo "Creating GitHub release: $TAG"
+          if [ "$PDF_EXISTS" = "true" ]; then
+            gh release create "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              "$REPORT_FILE#${REPORT_NAME}" \
+              "$PDF_FILE#${PDF_NAME}"
+          else
+            gh release create "$TAG" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              "$REPORT_FILE#${REPORT_NAME}"
+          fi
+
+          if [ $? -eq 0 ]; then
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+            DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${REPORT_NAME}"
+           
+            echo "Release created successfully!"
+            echo "Release URL: $RELEASE_URL"
+            echo "Download URL: $DOWNLOAD_URL"
+           
+            echo "uploaded=true" >> $GITHUB_OUTPUT
+            echo "release_tag=$TAG" >> $GITHUB_OUTPUT
+            echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+            echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+            echo "report_name=$REPORT_NAME" >> $GITHUB_OUTPUT
+
+            # Output PDF download URL if PDF was uploaded
+            if [ "$PDF_EXISTS" = "true" ]; then
+              PDF_DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${PDF_NAME}"
+              echo "PDF Download URL: $PDF_DOWNLOAD_URL"
+              echo "pdf_download_url=$PDF_DOWNLOAD_URL" >> $GITHUB_OUTPUT
+              echo "pdf_uploaded=true" >> $GITHUB_OUTPUT
+            else
+              echo "pdf_uploaded=false" >> $GITHUB_OUTPUT
+              echo "pdf_download_url=" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Failed to create release"
+            echo "uploaded=false" >> $GITHUB_OUTPUT
+            echo "pdf_uploaded=false" >> $GITHUB_OUTPUT
+          fi
+Changes in this step:
+
+Added PDF_FILE and PDF_NAME variables sourced from steps.generate_report.outputs.pdf_report_path and steps.generate_report.outputs.pdf_report_name
+Added a check to verify if the PDF file exists (PDF_EXISTS flag)
+Logged PDF file details (path, name, size)
+Updated the release notes text to mention both HTML and PDF downloads
+Split gh release create into two branches — one attaching both HTML + PDF, one attaching only HTML
+Added pdf_download_url and pdf_uploaded as new step outputs
+Ensured pdf_uploaded=false and empty pdf_download_url are set on failure paths
+
+
+2. Job Outputs — Expose PDF URL to the Notify Job
+In the job that runs the upload step, add the new outputs so the notify job can access them:
+yaml    outputs:
+      # ... existing outputs ...
+      download_url: ${{ steps.upload_artifact.outputs.download_url }}
+      release_url: ${{ steps.upload_artifact.outputs.release_url }}
+      report_url: ${{ steps.upload_artifact.outputs.report_url }}
+      pdf_download_url: ${{ steps.upload_artifact.outputs.pdf_download_url }}
+      pdf_uploaded: ${{ steps.upload_artifact.outputs.pdf_uploaded }}
+Changes in this step:
+
+Added pdf_download_url job output mapped to the upload step output
+Added pdf_uploaded job output for conditional logic in the notify job
+
+
+3. Notify Job — Read the New PDF Variables
+At the top of the Teams notification step, add the new variable:
+bash          # Get values from previous job
+          CURRENT_LEVEL="${{ needs.check-updates.outputs.current_level }}"
+          LATEST_LEVEL="${{ needs.check-updates.outputs.latest_level }}"
+          UPDATES_AVAILABLE="${{ needs.check-updates.outputs.updates_available }}"
+          UPDATES_COUNT="${{ needs.check-updates.outputs.updates_count }}"
+          STATUS="${{ needs.check-updates.outputs.status }}"
+          HOST="${{ needs.check-updates.outputs.host }}"
+          PRODUCT="${{ needs.check-updates.outputs.product }}"
+          PRODUCT_VERSION="${{ needs.check-updates.outputs.product_version }}"
+          HAS_CONFLICTS="${{ needs.check-updates.outputs.has_conflicts }}"
+          CONFLICT_COUNT="${{ needs.check-updates.outputs.conflict_count }}"
+          CONFLICT_FILES="${{ needs.check-updates.outputs.conflict_files }}"
+          DRY_RUN_ID="${{ needs.check-updates.outputs.dry_run_id }}"
+          DRY_RUN_PATH="${{ needs.check-updates.outputs.dry_run_path }}"
+          REPORT_URL="${{ needs.check-updates.outputs.report_url }}"
+          DOWNLOAD_URL="${{ needs.check-updates.outputs.download_url }}"
+          RELEASE_URL="${{ needs.check-updates.outputs.release_url }}"
+          PDF_DOWNLOAD_URL="${{ needs.check-updates.outputs.pdf_download_url }}"
+          PDF_UPLOADED="${{ needs.check-updates.outputs.pdf_uploaded }}"
+Changes in this step:
+
+Added PDF_DOWNLOAD_URL variable from needs.check-updates.outputs.pdf_download_url
+Added PDF_UPLOADED variable from needs.check-updates.outputs.pdf_uploaded
+
+
+4. Notify Job — Update the Actions (Buttons) Block
+Replace the entire actions-building section with the updated logic that conditionally adds the PDF button:
+bash          # Build potential actions with report link if available
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DOWNLOAD_URL" ]; then
+            # Start with base actions
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              --arg download_url "$DOWNLOAD_URL" \
+              --arg release_url "$RELEASE_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 Download Conflict Report",
+                  "targets": [{ "os": "default", "uri": $download_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📦 View Release",
+                  "targets": [{ "os": "default", "uri": $release_url }]
+                }
+              ]')
+
+            # Add PDF download button if PDF was uploaded
+            if [ "$PDF_UPLOADED" = "true" ] && [ -n "$PDF_DOWNLOAD_URL" ]; then
+              ACTIONS=$(echo "$ACTIONS" | jq --arg pdf_url "$PDF_DOWNLOAD_URL" \
+                '. + [{
+                  "@type": "OpenUri",
+                  "name": "📥 Download PDF Report",
+                  "targets": [{ "os": "default", "uri": $pdf_url }]
+                }]')
+            fi
+
+          elif [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
+            # Fallback to nginx-hosted report if release upload failed
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              --arg report_url "$REPORT_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                },
+                {
+                  "@type": "OpenUri",
+                  "name": "📄 View Conflict Report",
+                  "targets": [{ "os": "default", "uri": $report_url }]
+                }
+              ]')
+          else
+            ACTIONS=$(jq -n \
+              --arg workflow_url "$WORKFLOW_URL" \
+              '[
+                {
+                  "@type": "OpenUri",
+                  "name": "View Workflow Run",
+                  "targets": [{ "os": "default", "uri": $workflow_url }]
+                }
+              ]')
+          fi
+Changes in this step:
+
+In the primary branch (HAS_CONFLICTS + DOWNLOAD_URL), added a conditional block after the base actions that appends the "📥 Download PDF Report" button using jq
+The PDF button is only added when PDF_UPLOADED is true AND PDF_DOWNLOAD_URL is not empty
+Kept the fallback branches (REPORT_URL and default) unchanged since PDF wouldn't be available in those scenarios
+Used jq append (. + [...]) pattern to dynamically add the button, consistent with how conflict facts are appended elsewhere in the workflow
+
+
+Summary of All Changes
+#File/StepChange1Upload stepAdded PDF_FILE and PDF_NAME variables2Upload stepAdded PDF file existence check (PDF_EXISTS)3Upload stepLogged PDF file details4Upload stepUpdated release notes to mention PDF5Upload stepSplit gh release create to conditionally attach PDF6Upload stepAdded pdf_download_url output7Upload stepAdded pdf_uploaded output8Upload stepSet fallback values on failure paths9Job outputsAdded pdf_download_url output mapping10Job outputsAdded pdf_uploaded output mapping11Notify stepAdded PDF_DOWNLOAD_URL variable12Notify stepAdded PDF_UPLOADED variable13Notify stepAdded conditional PDF button append logic using jq14Notify stepPDF button only shown when upload succeeded
