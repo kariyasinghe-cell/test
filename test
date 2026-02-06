@@ -1,15 +1,489 @@
-Here's a comprehensive breakdown of all changes needed, organized by the workflow steps they affect.
+name: Check WSO2 IAM Update Level
 
-Changes Required
-1. Upload Step — Attach PDF to the GitHub Release
-In the upload_artifact step, update the gh release create command to include the PDF file:
-bash      - name: Upload conflict report to GitHub Release
+on:
+  schedule:
+    - cron: '0 9 1 * *'
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select the Environment'
+        required: true
+        type: choice
+        options:
+          - 'DEV'
+          - 'SIT'
+          - 'UAT_NODE_1'
+          - 'UAT_NODE_2'
+        default: 'DEV'
+
+env:
+  DEFAULT_ENVIRONMENT: 'DEV'
+
+jobs:
+  check-updates:
+    name: Check WSO2 Update Levels
+    permissions:
+      contents: write
+    runs-on: [self-hosted, ansible]
+    outputs:
+      report_json: ${{ steps.parse_report.outputs.report_json }}
+      current_level: ${{ steps.parse_report.outputs.current_level }}
+      latest_level: ${{ steps.parse_report.outputs.latest_level }}
+      updates_available: ${{ steps.parse_report.outputs.updates_available }}
+      updates_count: ${{ steps.parse_report.outputs.updates_count }}
+      status: ${{ steps.parse_report.outputs.status }}
+      host: ${{ steps.parse_report.outputs.host }}
+      product: ${{ steps.parse_report.outputs.product }}
+      product_version: ${{ steps.parse_report.outputs.product_version }}
+      hotfixes: ${{ steps.parse_report.outputs.hotfixes }}
+      tool_version: ${{ steps.parse_report.outputs.tool_version }}
+      check_timestamp: ${{ steps.parse_report.outputs.check_timestamp }}
+      has_conflicts: ${{ steps.parse_report.outputs.has_conflicts }}
+      conflict_count: ${{ steps.parse_report.outputs.conflict_count }}
+      conflict_files: ${{ steps.parse_report.outputs.conflict_files }}
+      conflict_files_json: ${{ steps.parse_report.outputs.conflict_files_json }}
+      dry_run_id: ${{ steps.parse_report.outputs.dry_run_id }}
+      dry_run_path: ${{ steps.parse_report.outputs.dry_run_path }}
+      release_url: ${{ steps.upload_artifact.outputs.release_url }}
+      download_url: ${{ steps.upload_artifact.outputs.download_url }}
+      report_url: ${{ steps.upload_artifact.outputs.report_url }}
+      pdf_download_url: ${{ steps.upload_artifact.outputs.pdf_download_url }}
+      pdf_uploaded: ${{ steps.upload_artifact.outputs.pdf_uploaded }}
+      uploaded: ${{ steps.upload_artifact.outputs.uploaded }}
+    steps:
+      - name: Setup workspace
+        id: setup
+        run: |
+          WORKSPACE="${{ github.workspace }}/${{ github.run_id }}-update-check"
+          mkdir -p "$WORKSPACE/bin"
+          echo "workspace=$WORKSPACE" >> $GITHUB_OUTPUT
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: ${{ steps.setup.outputs.workspace }}
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ENVIRONMENT="${{ env.DEFAULT_ENVIRONMENT }}"
+          else
+            ENVIRONMENT="${{ inputs.environment }}"
+          fi
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "Running update check for: $ENVIRONMENT"
+
+      - name: Set environment-specific secrets
+        id: env-secrets
+        run: |
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+
+          case "$ENVIRONMENT" in
+            DEV)
+              echo "ssh_host=${{ secrets.WSO2_HOST_DEV }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_DEV }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_DEV }}" >> $GITHUB_OUTPUT
+              echo "inventory_file=DEV.yml" >> $GITHUB_OUTPUT
+              echo "group_vars_file=DEV.yml" >> $GITHUB_OUTPUT
+              ;;
+            SIT)
+              echo "ssh_host=${{ secrets.WSO2_HOST_SIT }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_SIT }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_SIT }}" >> $GITHUB_OUTPUT
+              echo "inventory_file=SIT.yml" >> $GITHUB_OUTPUT
+              echo "group_vars_file=SIT.yml" >> $GITHUB_OUTPUT
+              ;;
+            UAT_NODE_1)
+              echo "ssh_host=${{ secrets.WSO2_HOST_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              echo "inventory_file=UAT_NODE_1.yml" >> $GITHUB_OUTPUT
+              echo "group_vars_file=UAT_NODE_1.yml" >> $GITHUB_OUTPUT
+              ;;
+            UAT_NODE_2)
+              echo "ssh_host=${{ secrets.WSO2_HOST_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              echo "inventory_file=UAT_NODE_2.yml" >> $GITHUB_OUTPUT
+              echo "group_vars_file=UAT_NODE_2.yml" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Unknown environment: $ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+          echo "Environment secrets configured for: $ENVIRONMENT"
+
+      - name: Verify SSH Access
+        run: |
+          sshpass -p "${{ steps.env-secrets.outputs.ssh_pass }}" ssh -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            -o BatchMode=no \
+            -o PubkeyAuthentication=no \
+            "${{ steps.env-secrets.outputs.ssh_user }}@${{ steps.env-secrets.outputs.ssh_host }}" "echo 'Connection successful'" \
+            && echo "✓ SSH access verified" \
+            || { echo "✗ SSH access failed"; exit 1; }
+
+      - name: Generate dynamic inventory
+        run: |
+          mkdir -p ${{ steps.setup.outputs.workspace }}/ansible/inventory
+
+          cat > ${{ steps.setup.outputs.workspace }}/ansible/inventory/dynamic.ini << EOF
+          [wso2_servers]
+          wso2-server ansible_host=${{ steps.env-secrets.outputs.ssh_host }} ansible_user=${{ steps.env-secrets.outputs.ssh_user }} ansible_password=${{ steps.env-secrets.outputs.ssh_pass }}
+          EOF
+
+          echo "Generated inventory:"
+          cat ${{ steps.setup.outputs.workspace }}/ansible/inventory/dynamic.ini
+
+      - name: Run Update Level Check
+        id: ansible
+        working-directory: ${{ steps.setup.outputs.workspace }}/ansible
+        env:
+          WSO2_UPDATE_USERNAME: ${{ secrets.WSO2_SECURE_UPDATE_USERNAME }}
+          WSO2_UPDATE_PASSWORD: ${{ secrets.WSO2_SECURE_UPDATE_PASSWORD }}
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          ANSIBLE_FORKS: "1"
+        run: |
+          set +e
+
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          INVENTORY_FILE="inventory/${{ steps.env-secrets.outputs.inventory_file }}"
+          GROUP_VARS_FILE="group_vars/${{ steps.env-secrets.outputs.group_vars_file }}"
+          PLAYBOOK_FILE="playbooks/check-update-level.yml"
+
+          if [ ! -f "$INVENTORY_FILE" ]; then
+            echo "::error::Inventory not found: $INVENTORY_FILE"
+            exit 1
+          fi
+
+          echo "Running update level check for $ENVIRONMENT..."
+
+          ansible-playbook "$PLAYBOOK_FILE" \
+            -i "inventory/dynamic.ini" \
+            -f 1 \
+            -e "@group_vars/all.yml" \
+            -e "@$GROUP_VARS_FILE" \
+            -e "ansible_host_ip=${{ steps.env-secrets.outputs.ssh_host }}" \
+            -e "ansible_ssh_user=${{ steps.env-secrets.outputs.ssh_user }}" \
+            -e "ansible_ssh_pass=${{ steps.env-secrets.outputs.ssh_pass }}" \
+            -e "wso2_update_username=$WSO2_UPDATE_USERNAME" \
+            -e "wso2_update_password=$WSO2_UPDATE_PASSWORD" \
+            -v 2>&1 | tee /tmp/ansible-output.log
+
+          ANSIBLE_EXIT_CODE=${PIPESTATUS[0]}
+
+          [ $ANSIBLE_EXIT_CODE -eq 0 ] && echo "result=success" >> $GITHUB_OUTPUT || echo "result=failure" >> $GITHUB_OUTPUT
+
+          exit $ANSIBLE_EXIT_CODE
+
+      - name: Parse update report
+        id: parse_report
+        run: |
+          # Find the report file
+          REPORT_FILE=$(ls /tmp/wso2_update_report_*.json 2>/dev/null | head -1)
+
+          if [ -f "$REPORT_FILE" ]; then
+            echo "Found report: $REPORT_FILE"
+            cat "$REPORT_FILE"
+
+            # Parse JSON and set outputs
+            CURRENT_LEVEL=$(jq -r '.current_level // "Unknown"' "$REPORT_FILE")
+            LATEST_LEVEL=$(jq -r '.latest_level // "Unknown"' "$REPORT_FILE")
+            UPDATES_AVAILABLE=$(jq -r '.updates_available // false' "$REPORT_FILE")
+            UPDATES_COUNT=$(jq -r '.updates_count // "0"' "$REPORT_FILE")
+            STATUS=$(jq -r '.status // "Unknown"' "$REPORT_FILE")
+            HOST=$(jq -r '.host // "Unknown"' "$REPORT_FILE")
+            PRODUCT=$(jq -r '.product // "Unknown"' "$REPORT_FILE")
+            PRODUCT_VERSION=$(jq -r '.product_version // "Unknown"' "$REPORT_FILE")
+            HOTFIXES=$(jq -r '.hotfixes_applied // "None"' "$REPORT_FILE")
+            TOOL_VERSION=$(jq -r '.tool_version // "Unknown"' "$REPORT_FILE")
+            CHECK_TIMESTAMP=$(jq -r '.check_timestamp // "Unknown"' "$REPORT_FILE")
+            HAS_CONFLICTS=$(jq -r '.has_conflicts // false' "$REPORT_FILE")
+            CONFLICT_COUNT=$(jq -r '.conflict_count // 0' "$REPORT_FILE")
+            DRY_RUN_ID=$(jq -r '.dry_run_id // ""' "$REPORT_FILE")
+            DRY_RUN_PATH=$(jq -r '.dry_run_path // ""' "$REPORT_FILE")
+
+            # Get conflict files as a comma-separated string for simple output
+            CONFLICT_FILES=$(jq -r '.conflict_files // [] | join(", ")' "$REPORT_FILE")
+            [ -z "$CONFLICT_FILES" ] && CONFLICT_FILES="None"
+
+            # Get conflict files as JSON array for detailed processing
+            CONFLICT_FILES_JSON=$(jq -c '.conflict_files // []' "$REPORT_FILE")
+
+            echo "current_level=$CURRENT_LEVEL" >> $GITHUB_OUTPUT
+            echo "latest_level=$LATEST_LEVEL" >> $GITHUB_OUTPUT
+            echo "updates_available=$UPDATES_AVAILABLE" >> $GITHUB_OUTPUT
+            echo "updates_count=$UPDATES_COUNT" >> $GITHUB_OUTPUT
+            echo "status=$STATUS" >> $GITHUB_OUTPUT
+            echo "host=$HOST" >> $GITHUB_OUTPUT
+            echo "product=$PRODUCT" >> $GITHUB_OUTPUT
+            echo "product_version=$PRODUCT_VERSION" >> $GITHUB_OUTPUT
+            echo "hotfixes=$HOTFIXES" >> $GITHUB_OUTPUT
+            echo "tool_version=$TOOL_VERSION" >> $GITHUB_OUTPUT
+            echo "check_timestamp=$CHECK_TIMESTAMP" >> $GITHUB_OUTPUT
+            echo "has_conflicts=$HAS_CONFLICTS" >> $GITHUB_OUTPUT
+            echo "conflict_count=$CONFLICT_COUNT" >> $GITHUB_OUTPUT
+            echo "conflict_files=$CONFLICT_FILES" >> $GITHUB_OUTPUT
+            echo "conflict_files_json=$CONFLICT_FILES_JSON" >> $GITHUB_OUTPUT
+            echo "dry_run_id=$DRY_RUN_ID" >> $GITHUB_OUTPUT
+            echo "dry_run_path=$DRY_RUN_PATH" >> $GITHUB_OUTPUT
+
+            # Store full JSON for notification
+            REPORT_JSON=$(cat "$REPORT_FILE" | jq -c .)
+            echo "report_json=$REPORT_JSON" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Report file not found"
+            echo "current_level=Unknown" >> $GITHUB_OUTPUT
+            echo "latest_level=Unknown" >> $GITHUB_OUTPUT
+            echo "updates_available=false" >> $GITHUB_OUTPUT
+            echo "updates_count=0" >> $GITHUB_OUTPUT
+            echo "status=Check Failed" >> $GITHUB_OUTPUT
+            echo "host=Unknown" >> $GITHUB_OUTPUT
+            echo "product=Unknown" >> $GITHUB_OUTPUT
+            echo "product_version=Unknown" >> $GITHUB_OUTPUT
+            echo "has_conflicts=false" >> $GITHUB_OUTPUT
+            echo "conflict_count=0" >> $GITHUB_OUTPUT
+            echo "conflict_files=None" >> $GITHUB_OUTPUT
+            echo "conflict_files_json=[]" >> $GITHUB_OUTPUT
+            echo "dry_run_id=" >> $GITHUB_OUTPUT
+            echo "dry_run_path=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate conflict comparison reports (HTML + PDF)
+        id: generate_report
+        if: steps.parse_report.outputs.has_conflicts == 'true'
+        run: |
+          COMPARISONS_FILE="/tmp/wso2_conflict_comparisons_*.json"
+          COMPARISONS_FILE_FOUND=$(ls $COMPARISONS_FILE 2>/dev/null | head -1)
+
+          if [ -z "$COMPARISONS_FILE_FOUND" ] || [ ! -f "$COMPARISONS_FILE_FOUND" ]; then
+            echo "No comparisons file found, skipping report generation"
+            echo "report_generated=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Found comparisons file: $COMPARISONS_FILE_FOUND"
+
+          # Ensure wkhtmltopdf is available for PDF generation
+          if ! command -v wkhtmltopdf &> /dev/null; then
+            echo "wkhtmltopdf not found, attempting to install..."
+            if command -v apt-get &> /dev/null; then
+              sudo apt-get update -qq && sudo apt-get install -y -qq wkhtmltopdf 2>/dev/null || echo "::warning::Could not install wkhtmltopdf via apt"
+            elif command -v yum &> /dev/null; then
+              sudo yum install -y -q wkhtmltopdf 2>/dev/null || echo "::warning::Could not install wkhtmltopdf via yum"
+            fi
+          fi
+
+          # Create HTML report generation script
+          cat > /tmp/generate_diff_report.py << 'PYTHON_SCRIPT'
+          #!/usr/bin/env python3
+          import json
+          import sys
+          import difflib
+          from datetime import datetime
+          import html
+
+          def create_diff_html(comparisons_file, output_file, environment, product, current_level, latest_level):
+              with open(comparisons_file, 'r') as f:
+                  comparisons = json.load(f)
+
+              if not comparisons:
+                  print("No comparisons to process")
+                  return False
+
+              report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+              html_content = f'''<!DOCTYPE html>
+          <html lang="en">
+          <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>WSO2 Update Conflict Report</title>
+              <style>
+                  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+                  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; background: #f5f5f5; color: #333; line-height: 1.6; }}
+                  .container {{ max-width: 1400px; margin: 0 auto; padding: 20px; }}
+                  .header {{ background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); color: white; padding: 40px; border-radius: 10px; margin-bottom: 30px; text-align: center; }}
+                  .header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
+                  .info-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 30px 0; }}
+                  .info-card {{ background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                  .info-card .label {{ font-size: 0.85em; color: #666; text-transform: uppercase; }}
+                  .info-card .value {{ font-size: 1.4em; font-weight: 600; color: #1a1a2e; margin-top: 5px; }}
+                  .file-section {{ background: white; border-radius: 10px; margin-bottom: 30px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+                  .file-header {{ background: #e9ecef; padding: 20px; border-bottom: 1px solid #dee2e6; }}
+                  .file-header h2 {{ font-size: 1.1em; color: #495057; word-break: break-all; }}
+                  .diff-table {{ width: 100%; border-collapse: collapse; font-family: monospace; font-size: 12px; }}
+                  .diff-table td {{ padding: 2px 10px; white-space: pre-wrap; word-break: break-all; }}
+                  .diff-table .line-num {{ width: 50px; text-align: right; color: #adb5bd; background: #f8f9fa; }}
+                  .diff-table tr.added {{ background: #d4edda; }}
+                  .diff-table tr.removed {{ background: #f8d7da; }}
+                  .diff-table tr.header {{ background: #cce5ff; }}
+                  .diff-table tr.range {{ background: #e2e3e5; }}
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="header"><h1>WSO2 Update Conflict Report</h1></div>
+                  <div class="info-grid">
+                      <div class="info-card"><div class="label">Environment</div><div class="value">{html.escape(environment)}</div></div>
+                      <div class="info-card"><div class="label">Product</div><div class="value">{html.escape(product)}</div></div>
+                      <div class="info-card"><div class="label">Current Level</div><div class="value">v{html.escape(current_level)}</div></div>
+                      <div class="info-card"><div class="label">Target Level</div><div class="value">v{html.escape(latest_level)}</div></div>
+                      <div class="info-card"><div class="label">Files with Conflicts</div><div class="value">{len(comparisons)}</div></div>
+                      <div class="info-card"><div class="label">Report Generated</div><div class="value">{report_time}</div></div>
+                  </div>
+          '''
+
+              for idx, comp in enumerate(comparisons, 1):
+                  filename = comp.get('filename', 'Unknown file')
+                  original_content = comp.get('original_content', '')
+                  new_content = comp.get('new_content', '')
+
+                  html_content += f'<div class="file-section"><div class="file-header"><h2>File {idx}: {html.escape(filename)}</h2></div><div class="diff-container">'
+
+                  diff = list(difflib.unified_diff(original_content.splitlines(keepends=True), new_content.splitlines(keepends=True), lineterm=''))
+
+                  if not diff:
+                      html_content += '<p style="padding:20px">No differences found.</p>'
+                  else:
+                      html_content += '<table class="diff-table">'
+                      for i, line in enumerate(diff[:1000], 1):
+                          line_escaped = html.escape(line.rstrip())
+                          if line.startswith('+++') or line.startswith('---'):
+                              cls = 'header'
+                          elif line.startswith('@@'):
+                              cls = 'range'
+                          elif line.startswith('+'):
+                              cls = 'added'
+                          elif line.startswith('-'):
+                              cls = 'removed'
+                          else:
+                              cls = ''
+                          html_content += f'<tr class="{cls}"><td class="line-num">{i}</td><td>{line_escaped}</td></tr>'
+                      html_content += '</table>'
+                  html_content += '</div></div>'
+
+              html_content += '</div></body></html>'
+
+              with open(output_file, 'w') as f:
+                  f.write(html_content)
+              print(f"Report generated: {output_file}")
+              return True
+
+          if __name__ == "__main__":
+              success = create_diff_html(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else "Unknown", sys.argv[4] if len(sys.argv) > 4 else "WSO2", sys.argv[5] if len(sys.argv) > 5 else "Unknown", sys.argv[6] if len(sys.argv) > 6 else "Unknown")
+              sys.exit(0 if success else 1)
+          PYTHON_SCRIPT
+
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+          PRODUCT="${{ steps.parse_report.outputs.product }} ${{ steps.parse_report.outputs.product_version }}"
+          CURRENT_LEVEL="${{ steps.parse_report.outputs.current_level }}"
+          LATEST_LEVEL="${{ steps.parse_report.outputs.latest_level }}"
+
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          HTML_REPORT_FILE="/tmp/wso2_conflict_report_${ENVIRONMENT}_${TIMESTAMP}.html"
+          PDF_REPORT_FILE="/tmp/wso2_conflict_report_${ENVIRONMENT}_${TIMESTAMP}.pdf"
+
+          # ── Generate HTML report ──
+          python3 /tmp/generate_diff_report.py "$COMPARISONS_FILE_FOUND" "$HTML_REPORT_FILE" "$ENVIRONMENT" "$PRODUCT" "$CURRENT_LEVEL" "$LATEST_LEVEL"
+
+          if [ -f "$HTML_REPORT_FILE" ]; then
+            echo "HTML report generated successfully: $HTML_REPORT_FILE"
+            echo "report_path=$HTML_REPORT_FILE" >> $GITHUB_OUTPUT
+            echo "report_generated=true" >> $GITHUB_OUTPUT
+            echo "report_name=$(basename $HTML_REPORT_FILE)" >> $GITHUB_OUTPUT
+          else
+            echo "Failed to generate HTML report"
+            echo "report_generated=false" >> $GITHUB_OUTPUT
+            echo "pdf_report_path=" >> $GITHUB_OUTPUT
+            echo "pdf_report_name=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # ── Generate PDF report from HTML ──
+          PDF_GENERATED=false
+
+          if command -v wkhtmltopdf &> /dev/null; then
+            echo "Generating PDF using wkhtmltopdf..."
+            wkhtmltopdf \
+              --page-size A4 \
+              --orientation Landscape \
+              --margin-top 10mm \
+              --margin-bottom 10mm \
+              --margin-left 10mm \
+              --margin-right 10mm \
+              --encoding UTF-8 \
+              --no-stop-slow-scripts \
+              --enable-local-file-access \
+              "$HTML_REPORT_FILE" "$PDF_REPORT_FILE" 2>&1 || true
+
+            if [ -f "$PDF_REPORT_FILE" ] && [ -s "$PDF_REPORT_FILE" ]; then
+              PDF_GENERATED=true
+              echo "PDF generated successfully: $PDF_REPORT_FILE ($(stat -c%s "$PDF_REPORT_FILE") bytes)"
+            else
+              echo "::warning::wkhtmltopdf ran but output is empty or missing"
+            fi
+          else
+            echo "::warning::wkhtmltopdf not available — trying Python fallback..."
+
+            # Fallback: try weasyprint
+            python3 -c "
+          try:
+              import weasyprint
+              weasyprint.HTML(filename='$HTML_REPORT_FILE').write_pdf('$PDF_REPORT_FILE')
+              print('PDF generated via weasyprint')
+          except ImportError:
+              print('weasyprint not available')
+          except Exception as e:
+              print(f'weasyprint failed: {e}')
+          " 2>&1 || true
+
+            if [ -f "$PDF_REPORT_FILE" ] && [ -s "$PDF_REPORT_FILE" ]; then
+              PDF_GENERATED=true
+              echo "PDF generated via weasyprint: $PDF_REPORT_FILE ($(stat -c%s "$PDF_REPORT_FILE") bytes)"
+            else
+              echo "::warning::PDF generation failed — no PDF tool available on this runner"
+              echo "::warning::Install wkhtmltopdf on the self-hosted runner: sudo apt-get install -y wkhtmltopdf"
+            fi
+          fi
+
+          if [ "$PDF_GENERATED" = "true" ]; then
+            echo "pdf_report_path=$PDF_REPORT_FILE" >> $GITHUB_OUTPUT
+            echo "pdf_report_name=$(basename $PDF_REPORT_FILE)" >> $GITHUB_OUTPUT
+          else
+            echo "pdf_report_path=" >> $GITHUB_OUTPUT
+            echo "pdf_report_name=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Ensure GitHub CLI is available
+        run: |
+          INSTALL_DIR="${RUNNER_WORKSPACE}/gh-cli"
+
+          if [ -d "$INSTALL_DIR" ] && [ -x "$INSTALL_DIR/bin/gh" ]; then
+            echo "GitHub CLI already installed in $INSTALL_DIR, adding to PATH..."
+            echo "$INSTALL_DIR/bin" >> $GITHUB_PATH
+            export PATH="$INSTALL_DIR/bin:$PATH"
+          else
+            echo "GitHub CLI not found, installing in runner workspace..."
+            mkdir -p "$INSTALL_DIR"
+            curl -sSL https://github.com/cli/cli/releases/download/v2.79.0/gh_2.79.0_linux_amd64.tar.gz -o ghcli.tar.gz
+            tar -xzf ghcli.tar.gz -C "$INSTALL_DIR" --strip-components=1
+            echo "$INSTALL_DIR/bin" >> $GITHUB_PATH
+            export PATH="$INSTALL_DIR/bin:$PATH"
+            echo "export PATH=$INSTALL_DIR/bin:\$PATH" >> $HOME/.bashrc
+          fi
+
+      - name: Upload conflict report to GitHub Release
         id: upload_artifact
         if: steps.generate_report.outputs.report_generated == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HTTPS_PROXY: 'http://*.*.*.*:8080'
-          HTTP_PROXY: 'http://*.*.*.*:8080'
+          HTTPS_PROXY: 'http://192.168.5.60:8080'
+          HTTP_PROXY: 'http://192.168.5.60:8080'
         run: |
           REPORT_FILE="${{ steps.generate_report.outputs.report_path }}"
           REPORT_NAME="${{ steps.generate_report.outputs.report_name }}"
@@ -17,74 +491,83 @@ bash      - name: Upload conflict report to GitHub Release
           PDF_NAME="${{ steps.generate_report.outputs.pdf_report_name }}"
           DRY_RUN_ID="${{ steps.parse_report.outputs.dry_run_id }}"
           ENVIRONMENT="${{ steps.env.outputs.environment }}"
-         
+
           if [ ! -f "$REPORT_FILE" ]; then
             echo "Report file not found: $REPORT_FILE"
             echo "uploaded=false" >> $GITHUB_OUTPUT
+            echo "pdf_uploaded=false" >> $GITHUB_OUTPUT
+            echo "pdf_download_url=" >> $GITHUB_OUTPUT
             exit 0
           fi
-         
+
           echo "Report file: $REPORT_FILE"
           echo "Report name: $REPORT_NAME"
           echo "File size: $(stat -c%s "$REPORT_FILE") bytes"
 
           # Check if PDF exists
-          if [ -f "$PDF_FILE" ]; then
+          PDF_EXISTS=false
+          if [ -n "$PDF_FILE" ] && [ -f "$PDF_FILE" ] && [ -s "$PDF_FILE" ]; then
             echo "PDF file: $PDF_FILE"
             echo "PDF name: $PDF_NAME"
             echo "PDF size: $(stat -c%s "$PDF_FILE") bytes"
             PDF_EXISTS=true
           else
-            echo "PDF file not found, skipping PDF upload"
-            PDF_EXISTS=false
+            echo "PDF file not found or empty, will upload HTML only"
           fi
-         
+
           # Create release tag based on environment and timestamp
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
           TAG="wso2-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
           RELEASE_TITLE="WSO2 Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
-         
+
           # Create release notes
           RELEASE_NOTES="## WSO2 Update Conflict Report
-         
+
           **Environment:** ${ENVIRONMENT}
           **Dry Run ID:** ${DRY_RUN_ID}
           **Generated:** $(date '+%Y-%m-%d %H:%M:%S')
           **Workflow Run:** [View Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-         
+
           ### Conflicts Detected
           - **Current Level:** v${{ steps.parse_report.outputs.current_level }}
           - **Target Level:** v${{ steps.parse_report.outputs.latest_level }}
           - **Conflict Count:** ${{ steps.parse_report.outputs.conflict_count }} file(s)
-         
+
           ### Download
-          Download the HTML or PDF report below to view the detailed diff comparison of conflicting files."
-         
+          Download the HTML report below to view the detailed diff comparison of conflicting files."
+
           echo "Creating release with tag: $TAG"
-         
-          # Build the gh release create command with conditional PDF attachment
+
+          # Build gh release create command with conditional PDF attachment
           echo "Creating GitHub release: $TAG"
+
+          RELEASE_CMD="gh release create \"$TAG\" --title \"$RELEASE_TITLE\" --notes \"$RELEASE_NOTES\" \"$REPORT_FILE#${REPORT_NAME}\""
+
           if [ "$PDF_EXISTS" = "true" ]; then
+            echo "Attaching both HTML and PDF to release..."
             gh release create "$TAG" \
               --title "$RELEASE_TITLE" \
               --notes "$RELEASE_NOTES" \
               "$REPORT_FILE#${REPORT_NAME}" \
               "$PDF_FILE#${PDF_NAME}"
+            RELEASE_EXIT=$?
           else
+            echo "Attaching HTML only to release..."
             gh release create "$TAG" \
               --title "$RELEASE_TITLE" \
               --notes "$RELEASE_NOTES" \
               "$REPORT_FILE#${REPORT_NAME}"
+            RELEASE_EXIT=$?
           fi
 
-          if [ $? -eq 0 ]; then
+          if [ $RELEASE_EXIT -eq 0 ]; then
             RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
             DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${REPORT_NAME}"
-           
+
             echo "Release created successfully!"
             echo "Release URL: $RELEASE_URL"
             echo "Download URL: $DOWNLOAD_URL"
-           
+
             echo "uploaded=true" >> $GITHUB_OUTPUT
             echo "release_tag=$TAG" >> $GITHUB_OUTPUT
             echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
@@ -102,39 +585,43 @@ bash      - name: Upload conflict report to GitHub Release
               echo "pdf_download_url=" >> $GITHUB_OUTPUT
             fi
           else
-            echo "Failed to create release"
+            echo "::error::Failed to create release (exit code: $RELEASE_EXIT)"
+            echo "::error::If you see HTTP 403, ensure 'permissions: contents: write' is set or use a PAT"
             echo "uploaded=false" >> $GITHUB_OUTPUT
             echo "pdf_uploaded=false" >> $GITHUB_OUTPUT
+            echo "pdf_download_url=" >> $GITHUB_OUTPUT
+            echo "release_url=" >> $GITHUB_OUTPUT
+            echo "download_url=" >> $GITHUB_OUTPUT
           fi
-Changes in this step:
 
-Added PDF_FILE and PDF_NAME variables sourced from steps.generate_report.outputs.pdf_report_path and steps.generate_report.outputs.pdf_report_name
-Added a check to verify if the PDF file exists (PDF_EXISTS flag)
-Logged PDF file details (path, name, size)
-Updated the release notes text to mention both HTML and PDF downloads
-Split gh release create into two branches — one attaching both HTML + PDF, one attaching only HTML
-Added pdf_download_url and pdf_uploaded as new step outputs
-Ensured pdf_uploaded=false and empty pdf_download_url are set on failure paths
+  notify-teams:
+    name: Send Teams Notification
+    runs-on: ubuntu-latest
+    needs: check-updates
+    if: always()
+    env:
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+    steps:
+      - name: Install jq
+        run: |
+          INSTALL_DIR="/tmp/bin"
+          mkdir -p "$INSTALL_DIR"
 
+          if [ ! -x "$INSTALL_DIR/jq" ]; then
+            curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$INSTALL_DIR/jq"
+            chmod +x "$INSTALL_DIR/jq"
+          fi
 
-2. Job Outputs — Expose PDF URL to the Notify Job
-In the job that runs the upload step, add the new outputs so the notify job can access them:
-yaml    outputs:
-      # ... existing outputs ...
-      download_url: ${{ steps.upload_artifact.outputs.download_url }}
-      release_url: ${{ steps.upload_artifact.outputs.release_url }}
-      report_url: ${{ steps.upload_artifact.outputs.report_url }}
-      pdf_download_url: ${{ steps.upload_artifact.outputs.pdf_download_url }}
-      pdf_uploaded: ${{ steps.upload_artifact.outputs.pdf_uploaded }}
-Changes in this step:
+          echo "$INSTALL_DIR" >> $GITHUB_PATH
 
-Added pdf_download_url job output mapped to the upload step output
-Added pdf_uploaded job output for conditional logic in the notify job
+      - name: Send Teams notification
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "Teams webhook not configured, skipping"
+            exit 0
+          fi
 
-
-3. Notify Job — Read the New PDF Variables
-At the top of the Teams notification step, add the new variable:
-bash          # Get values from previous job
+          # Get values from previous job
           CURRENT_LEVEL="${{ needs.check-updates.outputs.current_level }}"
           LATEST_LEVEL="${{ needs.check-updates.outputs.latest_level }}"
           UPDATES_AVAILABLE="${{ needs.check-updates.outputs.updates_available }}"
@@ -153,84 +640,208 @@ bash          # Get values from previous job
           RELEASE_URL="${{ needs.check-updates.outputs.release_url }}"
           PDF_DOWNLOAD_URL="${{ needs.check-updates.outputs.pdf_download_url }}"
           PDF_UPLOADED="${{ needs.check-updates.outputs.pdf_uploaded }}"
-Changes in this step:
+          UPLOADED="${{ needs.check-updates.outputs.uploaded }}"
 
-Added PDF_DOWNLOAD_URL variable from needs.check-updates.outputs.pdf_download_url
-Added PDF_UPLOADED variable from needs.check-updates.outputs.pdf_uploaded
+          # ── Debug: Print all values to verify they're passed correctly ──
+          echo "============================================"
+          echo "DEBUG: Notify Job Variables"
+          echo "============================================"
+          echo "HAS_CONFLICTS    = '$HAS_CONFLICTS'"
+          echo "UPLOADED         = '$UPLOADED'"
+          echo "DOWNLOAD_URL     = '$DOWNLOAD_URL'"
+          echo "RELEASE_URL      = '$RELEASE_URL'"
+          echo "PDF_DOWNLOAD_URL = '$PDF_DOWNLOAD_URL'"
+          echo "PDF_UPLOADED     = '$PDF_UPLOADED'"
+          echo "REPORT_URL       = '$REPORT_URL'"
+          echo "UPDATES_AVAILABLE= '$UPDATES_AVAILABLE'"
+          echo "============================================"
 
-
-4. Notify Job — Update the Actions (Buttons) Block
-Replace the entire actions-building section with the updated logic that conditionally adds the PDF button:
-bash          # Build potential actions with report link if available
-          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DOWNLOAD_URL" ]; then
-            # Start with base actions
-            ACTIONS=$(jq -n \
-              --arg workflow_url "$WORKFLOW_URL" \
-              --arg download_url "$DOWNLOAD_URL" \
-              --arg release_url "$RELEASE_URL" \
-              '[
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                },
-                {
-                  "@type": "OpenUri",
-                  "name": "📄 Download Conflict Report",
-                  "targets": [{ "os": "default", "uri": $download_url }]
-                },
-                {
-                  "@type": "OpenUri",
-                  "name": "📦 View Release",
-                  "targets": [{ "os": "default", "uri": $release_url }]
-                }
-              ]')
-
-            # Add PDF download button if PDF was uploaded
-            if [ "$PDF_UPLOADED" = "true" ] && [ -n "$PDF_DOWNLOAD_URL" ]; then
-              ACTIONS=$(echo "$ACTIONS" | jq --arg pdf_url "$PDF_DOWNLOAD_URL" \
-                '. + [{
-                  "@type": "OpenUri",
-                  "name": "📥 Download PDF Report",
-                  "targets": [{ "os": "default", "uri": $pdf_url }]
-                }]')
-            fi
-
-          elif [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
-            # Fallback to nginx-hosted report if release upload failed
-            ACTIONS=$(jq -n \
-              --arg workflow_url "$WORKFLOW_URL" \
-              --arg report_url "$REPORT_URL" \
-              '[
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                },
-                {
-                  "@type": "OpenUri",
-                  "name": "📄 View Conflict Report",
-                  "targets": [{ "os": "default", "uri": $report_url }]
-                }
-              ]')
+          # Determine theme color and title based on status
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            TITLE="🚨 WSO2 IAM Update Conflicts Detected"
+            THEME_COLOR="DC3545"
+          elif [ "$UPDATES_AVAILABLE" = "true" ]; then
+            TITLE="⚠️ WSO2 IAM Patch Updates Available"
+            THEME_COLOR="FFA500"
           else
-            ACTIONS=$(jq -n \
-              --arg workflow_url "$WORKFLOW_URL" \
-              '[
-                {
-                  "@type": "OpenUri",
-                  "name": "View Workflow Run",
-                  "targets": [{ "os": "default", "uri": $workflow_url }]
-                }
-              ]')
+            TITLE="✅ WSO2 IAM Update Check Complete"
+            THEME_COLOR="28A745"
           fi
-Changes in this step:
 
-In the primary branch (HAS_CONFLICTS + DOWNLOAD_URL), added a conditional block after the base actions that appends the "📥 Download PDF Report" button using jq
-The PDF button is only added when PDF_UPLOADED is true AND PDF_DOWNLOAD_URL is not empty
-Kept the fallback branches (REPORT_URL and default) unchanged since PDF wouldn't be available in those scenarios
-Used jq append (. + [...]) pattern to dynamically add the button, consistent with how conflict facts are appended elsewhere in the workflow
+          # Determine environment
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            ENVIRONMENT="${{ env.DEFAULT_ENVIRONMENT }}"
+            TRIGGER="Scheduled (Monthly)"
+          else
+            ENVIRONMENT="${{ inputs.environment }}"
+            TRIGGER="Manual"
+          fi
 
+          CHECK_TIME=$(TZ='Asia/Colombo' date +"%Y-%m-%d %H:%M:%S IST")
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ARTIFACT_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts"
 
-Summary of All Changes
-#File/StepChange1Upload stepAdded PDF_FILE and PDF_NAME variables2Upload stepAdded PDF file existence check (PDF_EXISTS)3Upload stepLogged PDF file details4Upload stepUpdated release notes to mention PDF5Upload stepSplit gh release create to conditionally attach PDF6Upload stepAdded pdf_download_url output7Upload stepAdded pdf_uploaded output8Upload stepSet fallback values on failure paths9Job outputsAdded pdf_download_url output mapping10Job outputsAdded pdf_uploaded output mapping11Notify stepAdded PDF_DOWNLOAD_URL variable12Notify stepAdded PDF_UPLOADED variable13Notify stepAdded conditional PDF button append logic using jq14Notify stepPDF button only shown when upload succeeded
+          # Build base facts array
+          FACTS=$(jq -n \
+            --arg env "$ENVIRONMENT" \
+            --arg product "$PRODUCT $PRODUCT_VERSION" \
+            --arg current "v$CURRENT_LEVEL" \
+            --arg latest "v$LATEST_LEVEL" \
+            --arg count "$UPDATES_COUNT update(s)" \
+            --arg trigger "$TRIGGER (${{ github.actor }})" \
+            --arg time "$CHECK_TIME" \
+            '[
+              { "name": "🌍 Environment", "value": ("**" + $env + "**") },
+              { "name": "🖥️ Host", "value": "IAM" },
+              { "name": "📦 Product", "value": $product },
+              { "name": "📍 Current Level", "value": $current },
+              { "name": "🎯 Latest Level", "value": $latest },
+              { "name": "🔄 Updates Count", "value": $count },
+              { "name": "👤 Triggered By", "value": $trigger },
+              { "name": "🕐 Check Time", "value": $time }
+            ]')
+
+          # Add conflict fact if needed
+          if [ "$HAS_CONFLICTS" = "true" ]; then
+            FACTS=$(echo "$FACTS" | jq --arg cc "$CONFLICT_COUNT" '. + [{ "name": "⚠️ Conflicts", "value": ("**" + $cc + " file(s) with conflicts**") }]')
+          fi
+
+          # Add dry run ID fact if conflicts exist and we have the ID
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$DRY_RUN_ID" ]; then
+            FACTS=$(echo "$FACTS" | jq --arg drid "$DRY_RUN_ID" '. + [{ "name": "🔖 Dry Run ID", "value": $drid }]')
+          fi
+
+          # Build main section
+          MAIN_SECTION=$(jq -n \
+            --arg title "$TITLE" \
+            --argjson facts "$FACTS" \
+            '{
+              "activityTitle": $title,
+              "facts": $facts,
+              "markdown": true
+            }')
+
+          # Build sections array starting with main section
+          SECTIONS=$(echo "[$MAIN_SECTION]")
+
+          # Add conflict files section if needed
+          if [ "$HAS_CONFLICTS" = "true" ] && [ -n "$CONFLICT_FILES" ] && [ "$CONFLICT_FILES" != "None" ]; then
+            # Build conflict files as facts array for better formatting
+            CONFLICT_FACTS=$(echo "$CONFLICT_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("File " + ((.key + 1) | tostring)), "value": .value })')
+
+            CONFLICT_SECTION=$(jq -n \
+              --argjson facts "$CONFLICT_FACTS" \
+              '{
+                "activityTitle": "📁 Conflict Files (Manual Resolution Required)",
+                "facts": $facts,
+                "markdown": true
+              }')
+
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson cs "$CONFLICT_SECTION" '. + [$cs]')
+          fi
+
+          # ──────────────────────────────────────────────
+          # Build potentialAction buttons
+          # ──────────────────────────────────────────────
+          # Always start with the "View Workflow Run" button
+          ACTIONS=$(jq -n \
+            --arg workflow_url "$WORKFLOW_URL" \
+            '[
+              {
+                "@type": "OpenUri",
+                "name": "🔗 View Workflow Run",
+                "targets": [{ "os": "default", "uri": $workflow_url }]
+              }
+            ]')
+
+          # Add HTML report download button if release was uploaded
+          if [ "$UPLOADED" = "true" ] && [ -n "$DOWNLOAD_URL" ]; then
+            ACTIONS=$(echo "$ACTIONS" | jq --arg url "$DOWNLOAD_URL" \
+              '. + [{
+                "@type": "OpenUri",
+                "name": "📄 Download HTML Report",
+                "targets": [{ "os": "default", "uri": $url }]
+              }]')
+          fi
+
+          # Add PDF report download button if PDF was uploaded
+          if [ "$PDF_UPLOADED" = "true" ] && [ -n "$PDF_DOWNLOAD_URL" ]; then
+            ACTIONS=$(echo "$ACTIONS" | jq --arg url "$PDF_DOWNLOAD_URL" \
+              '. + [{
+                "@type": "OpenUri",
+                "name": "📥 Download PDF Report",
+                "targets": [{ "os": "default", "uri": $url }]
+              }]')
+          fi
+
+          # Add "View Release" button if release URL exists
+          if [ "$UPLOADED" = "true" ] && [ -n "$RELEASE_URL" ]; then
+            ACTIONS=$(echo "$ACTIONS" | jq --arg url "$RELEASE_URL" \
+              '. + [{
+                "@type": "OpenUri",
+                "name": "📦 View Release",
+                "targets": [{ "os": "default", "uri": $url }]
+              }]')
+          fi
+
+          # Fallback: if upload failed but nginx report URL exists
+          if [ "$UPLOADED" != "true" ] && [ "$HAS_CONFLICTS" = "true" ] && [ -n "$REPORT_URL" ]; then
+            ACTIONS=$(echo "$ACTIONS" | jq --arg url "$REPORT_URL" \
+              '. + [{
+                "@type": "OpenUri",
+                "name": "📄 View Conflict Report",
+                "targets": [{ "os": "default", "uri": $url }]
+              }]')
+          fi
+
+          # Build final payload
+          JSON_PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg theme "$THEME_COLOR" \
+            --argjson sections "$SECTIONS" \
+            --argjson actions "$ACTIONS" \
+            '{
+              "@type": "MessageCard",
+              "@context": "http://schema.org/extensions",
+              "themeColor": $theme,
+              "summary": $title,
+              "sections": $sections,
+              "potentialAction": $actions
+            }')
+
+          echo "JSON Payload:"
+          echo "$JSON_PAYLOAD" | jq .
+
+          echo "Sending notification to Teams..."
+
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --proxy "${HTTPS_PROXY:-}" \
+            --connect-timeout 30 \
+            --max-time 60 \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "$TEAMS_WEBHOOK_URL")
+
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$HTTP_RESPONSE" | head -n -1)
+
+          echo "Response code: $HTTP_CODE"
+          echo "Response: $RESPONSE_BODY"
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::warning::Teams notification failed with code $HTTP_CODE"
+          else
+            echo "Teams notification sent successfully"
+          fi
+
+  cleanup:
+    name: Cleanup
+    runs-on: [self-hosted, ansible]
+    needs: [check-updates, notify-teams]
+    if: always()
+    steps:
+      - name: Cleanup workspace
+        run: |
+          WORKSPACE="${{ github.workspace }}/${{ github.run_id }}-update-check"
+          [ -d "$WORKSPACE" ] && rm -rf "$WORKSPACE"
+          rm -f /tmp/wso2_update_report_*.json
