@@ -1,22 +1,7 @@
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Target environment'
-        required: true
-        type: choice
-        options:
-          - dev
-          - staging
-          - production
-      dry_run:
-        description: 'Dry run mode'
-        required: false
-        type: boolean
-        default: false
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo "Deploying to ${{ inputs.environment }}, dry_run=${{ inputs.dry_run }}"
+- name: Install yq
+  run: |
+    mkdir -p "$HOME/bin"
+    wget -O "$HOME/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.48.2/yq_linux_amd64
+    chmod +x "$HOME/bin/yq"
+    echo "$HOME/bin" >> $GITHUB_PATH
+    echo "yq version: $($HOME/bin/yq --version)"
