@@ -497,12 +497,15 @@ jobs:
           Download the HTML report below to view the detailed diff comparison of conflicting files."
 
           set +e
-          gh release create "$TAG" \
+          GH_OUTPUT=$(gh release create "$TAG" \
             --title "$RELEASE_TITLE" \
             --notes "$RELEASE_NOTES" \
-            "$REPORT_FILE#${REPORT_NAME}"
+            "$REPORT_FILE#${REPORT_NAME}" 2>&1)
           CREATE_EXIT=$?
           set -e
+
+          echo "gh release output: $GH_OUTPUT"
+          echo "gh release exit code: $CREATE_EXIT"
 
           if [ $CREATE_EXIT -eq 0 ]; then
             RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
@@ -511,15 +514,24 @@ jobs:
             echo "Release created: $RELEASE_URL"
             echo "Download URL: $DOWNLOAD_URL"
 
-            echo "uploaded=true" >> $GITHUB_OUTPUT
-            echo "release_tag=$TAG" >> $GITHUB_OUTPUT
-            echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
-            echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
+            {
+              echo "uploaded=true"
+              echo "release_tag=${TAG}"
+              echo "release_url=${RELEASE_URL}"
+              echo "download_url=${DOWNLOAD_URL}"
+            } >> $GITHUB_OUTPUT
+
+            # Verify outputs were written
+            echo "=== Verify GITHUB_OUTPUT ==="
+            cat $GITHUB_OUTPUT
+            echo "==========================="
           else
             echo "::error::Failed to create release (exit code: $CREATE_EXIT)"
-            echo "uploaded=false" >> $GITHUB_OUTPUT
-            echo "download_url=" >> $GITHUB_OUTPUT
-            echo "release_url=" >> $GITHUB_OUTPUT
+            {
+              echo "uploaded=false"
+              echo "download_url="
+              echo "release_url="
+            } >> $GITHUB_OUTPUT
           fi
 
   notify-teams:
