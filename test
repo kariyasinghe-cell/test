@@ -48,6 +48,8 @@ jobs:
       release_url: ${{ steps.upload_report.outputs.release_url }}
       download_url: ${{ steps.upload_report.outputs.download_url }}
       uploaded: ${{ steps.upload_report.outputs.uploaded }}
+      release_tag: ${{ steps.upload_report.outputs.release_tag }}
+      report_name: ${{ steps.upload_report.outputs.report_name }}
     steps:
       - name: Setup workspace
         id: setup
@@ -264,7 +266,7 @@ jobs:
           CURRENT_LEVEL="${{ steps.parse_report.outputs.current_level }}"
           LATEST_LEVEL="${{ steps.parse_report.outputs.latest_level }}"
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-          HTML_FILE="/tmp/wso2_conflict_report_${ENVIRONMENT}_${TIMESTAMP}.html"
+          HTML_FILE="/tmp/iam_conflict_report_${ENVIRONMENT}_${TIMESTAMP}.html"
 
           # Generate HTML report using only Python standard library
           python3 - "$COMPARISONS_FILE" "$HTML_FILE" "$ENVIRONMENT" "$PRODUCT" "$CURRENT_LEVEL" "$LATEST_LEVEL" << 'PYTHON_SCRIPT'
@@ -478,8 +480,8 @@ jobs:
           echo "Uploading: $REPORT_NAME ($(stat -c%s "$REPORT_FILE") bytes)"
 
           TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          TAG="wso2-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
-          RELEASE_TITLE="WSO2 Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
+          TAG="iam-conflict-report-${ENVIRONMENT}-${TIMESTAMP}"
+          RELEASE_TITLE="IAM Conflict Report - ${ENVIRONMENT} - ${TIMESTAMP}"
 
           RELEASE_NOTES="## WSO2 Update Conflict Report
 
@@ -517,6 +519,7 @@ jobs:
             {
               echo "uploaded=true"
               echo "release_tag=${TAG}"
+              echo "report_name=${REPORT_NAME}"
               echo "release_url=${RELEASE_URL}"
               echo "download_url=${DOWNLOAD_URL}"
             } >> $GITHUB_OUTPUT
@@ -577,6 +580,17 @@ jobs:
           RELEASE_URL="${{ needs.check-updates.outputs.release_url }}"
           DOWNLOAD_URL="${{ needs.check-updates.outputs.download_url }}"
           UPLOADED="${{ needs.check-updates.outputs.uploaded }}"
+          RELEASE_TAG="${{ needs.check-updates.outputs.release_tag }}"
+          REPORT_NAME="${{ needs.check-updates.outputs.report_name }}"
+
+          # Reconstruct URLs from tag and report name if they weren't passed correctly
+          if [ "$UPLOADED" = "true" ] && [ -z "$DOWNLOAD_URL" ] && [ -n "$RELEASE_TAG" ]; then
+            echo "URLs empty but tag available, reconstructing..."
+            RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${RELEASE_TAG}"
+            DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${RELEASE_TAG}/${REPORT_NAME}"
+            echo "Reconstructed RELEASE_URL=$RELEASE_URL"
+            echo "Reconstructed DOWNLOAD_URL=$DOWNLOAD_URL"
+          fi
 
           # Determine theme color and title
           if [ "$HAS_CONFLICTS" = "true" ]; then
@@ -741,4 +755,4 @@ jobs:
           [ -d "$WORKSPACE" ] && rm -rf "$WORKSPACE"
           rm -f /tmp/wso2_update_report_*.json
           rm -f /tmp/wso2_conflict_comparisons_*.json
-          rm -f /tmp/wso2_conflict_report_*.html
+          rm -f /tmp/iam_conflict_report_*.html
