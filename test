@@ -496,12 +496,15 @@ jobs:
           ### Download
           Download the HTML report below to view the detailed diff comparison of conflicting files."
 
+          set +e
           gh release create "$TAG" \
             --title "$RELEASE_TITLE" \
             --notes "$RELEASE_NOTES" \
             "$REPORT_FILE#${REPORT_NAME}"
+          CREATE_EXIT=$?
+          set -e
 
-          if [ $? -eq 0 ]; then
+          if [ $CREATE_EXIT -eq 0 ]; then
             RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
             DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${REPORT_NAME}"
 
@@ -513,7 +516,7 @@ jobs:
             echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
             echo "download_url=$DOWNLOAD_URL" >> $GITHUB_OUTPUT
           else
-            echo "::error::Failed to create release"
+            echo "::error::Failed to create release (exit code: $CREATE_EXIT)"
             echo "uploaded=false" >> $GITHUB_OUTPUT
             echo "download_url=" >> $GITHUB_OUTPUT
             echo "release_url=" >> $GITHUB_OUTPUT
