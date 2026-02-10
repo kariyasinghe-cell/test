@@ -1,7 +1,459 @@
-- name: Install yq
-  run: |
-    mkdir -p "$HOME/bin"
-    wget -O "$HOME/bin/yq" https://github.com/mikefarah/yq/releases/download/v4.48.2/yq_linux_amd64
-    chmod +x "$HOME/bin/yq"
-    echo "$HOME/bin" >> $GITHUB_PATH
-    echo "yq version: $($HOME/bin/yq --version)"
+name: Resolve WSO2 IAM Update Conflicts
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select the Environment'
+        required: true
+        type: choice
+        options:
+          - 'DEV'
+          - 'SIT'
+          - 'UAT_NODE_1'
+          - 'UAT_NODE_2'
+        default: 'DEV'
+      dry_run_path:
+        description: 'Dry run conflicts path (from check workflow output)'
+        required: true
+        type: string
+      auto_resolve_patterns:
+        description: 'File patterns to auto-resolve (keep ours). Comma-separated. e.g. *.jsp,*.css'
+        required: true
+        type: string
+        default: '*.jsp'
+      dry_run:
+        description: 'Preview only — show what would be resolved without making changes'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  # ============================================================
+  # Job 1: Resolve conflicts
+  # ============================================================
+  resolve-conflicts:
+    name: Resolve Conflicts
+    runs-on: [self-hosted, ansible]
+    outputs:
+      total_conflicts: ${{ steps.resolve.outputs.total_conflicts }}
+      auto_resolved: ${{ steps.resolve.outputs.auto_resolved }}
+      remaining: ${{ steps.resolve.outputs.remaining }}
+      resolved_files: ${{ steps.resolve.outputs.resolved_files }}
+      remaining_files: ${{ steps.resolve.outputs.remaining_files }}
+      environment: ${{ steps.env.outputs.environment }}
+    steps:
+      - name: Setup workspace
+        id: setup
+        run: |
+          WORKSPACE="${{ github.workspace }}/${{ github.run_id }}-resolve"
+          mkdir -p "$WORKSPACE"
+          echo "workspace=$WORKSPACE" >> $GITHUB_OUTPUT
+
+      - name: Determine environment
+        id: env
+        run: |
+          echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+
+      - name: Set environment-specific secrets
+        id: env-secrets
+        run: |
+          ENVIRONMENT="${{ steps.env.outputs.environment }}"
+
+          case "$ENVIRONMENT" in
+            DEV)
+              echo "ssh_host=${{ secrets.WSO2_HOST_DEV }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_DEV }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_DEV }}" >> $GITHUB_OUTPUT
+              ;;
+            SIT)
+              echo "ssh_host=${{ secrets.WSO2_HOST_SIT }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_SIT }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_SIT }}" >> $GITHUB_OUTPUT
+              ;;
+            UAT_NODE_1)
+              echo "ssh_host=${{ secrets.WSO2_HOST_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_UAT_NODE_1 }}" >> $GITHUB_OUTPUT
+              ;;
+            UAT_NODE_2)
+              echo "ssh_host=${{ secrets.WSO2_HOST_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              echo "ssh_user=${{ secrets.WSO2_SSH_USERNAME_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              echo "ssh_pass=${{ secrets.WSO2_SSH_PASSWORD_UAT_NODE_2 }}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "::error::Unknown environment: $ENVIRONMENT"
+              exit 1
+              ;;
+          esac
+
+      - name: Verify SSH access
+        run: |
+          sshpass -p "${{ steps.env-secrets.outputs.ssh_pass }}" ssh -o StrictHostKeyChecking=no \
+            -o ConnectTimeout=10 \
+            -o BatchMode=no \
+            -o PubkeyAuthentication=no \
+            "${{ steps.env-secrets.outputs.ssh_user }}@${{ steps.env-secrets.outputs.ssh_host }}" "echo 'Connection successful'" \
+            && echo "✓ SSH access verified" \
+            || { echo "✗ SSH access failed"; exit 1; }
+
+      - name: Resolve conflicts
+        id: resolve
+        run: |
+          DRY_RUN_PATH="${{ inputs.dry_run_path }}"
+          PATTERNS="${{ inputs.auto_resolve_patterns }}"
+          IS_DRY_RUN="${{ inputs.dry_run }}"
+
+          echo "============================================"
+          echo "Conflict Resolution"
+          echo "============================================"
+          echo "Environment:  ${{ inputs.environment }}"
+          echo "Conflicts at: $DRY_RUN_PATH"
+          echo "Patterns:     $PATTERNS"
+          echo "Dry run:      $IS_DRY_RUN"
+          echo "============================================"
+
+          # Build the remote script
+          # Resolves conflicts by copying .original → .final for matching patterns
+          # .original = our current customized file
+          # .new      = incoming update version
+          # .final    = resolved version (what --continue will use)
+
+          REMOTE_SCRIPT=$(cat << 'REMOTE_EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          DRY_RUN_PATH="$1"
+          PATTERNS="$2"
+          IS_DRY_RUN="$3"
+
+          if [ ! -d "$DRY_RUN_PATH" ]; then
+            echo "ERROR: Conflicts directory not found: $DRY_RUN_PATH"
+            exit 1
+          fi
+
+          # Convert comma-separated patterns to array
+          IFS=',' read -ra PATTERN_LIST <<< "$PATTERNS"
+
+          # Trim whitespace from patterns
+          for i in "${!PATTERN_LIST[@]}"; do
+            PATTERN_LIST[$i]=$(echo "${PATTERN_LIST[$i]}" | xargs)
+          done
+
+          echo ""
+          echo "Scanning: $DRY_RUN_PATH"
+          echo "Patterns: ${PATTERN_LIST[*]}"
+          echo ""
+
+          # Find all .original files (each represents one conflict)
+          TOTAL=0
+          AUTO_RESOLVED=0
+          REMAINING=0
+          RESOLVED_LIST=""
+          REMAINING_LIST=""
+
+          while IFS= read -r original_file; do
+            [ -z "$original_file" ] && continue
+
+            TOTAL=$((TOTAL + 1))
+
+            # Get the base filename without .original suffix
+            base_file="${original_file%.original}"
+            base_name=$(basename "$base_file")
+            rel_path="${original_file#$DRY_RUN_PATH/}"
+            rel_path="${rel_path%.original}"
+
+            final_file="${base_file}.final"
+            new_file="${base_file}.new"
+
+            # Check if this file matches any auto-resolve pattern
+            MATCHED=false
+            for pattern in "${PATTERN_LIST[@]}"; do
+              # Use bash pattern matching (fnmatch style)
+              # shellcheck disable=SC2254
+              case "$base_name" in
+                $pattern)
+                  MATCHED=true
+                  break
+                  ;;
+              esac
+            done
+
+            if [ "$MATCHED" = "true" ]; then
+              AUTO_RESOLVED=$((AUTO_RESOLVED + 1))
+
+              if [ "$IS_DRY_RUN" = "true" ]; then
+                echo "[DRY RUN] Would resolve: $rel_path (keep ours)"
+              else
+                # Copy .original → .final (keep our version)
+                cp "$original_file" "$final_file"
+                echo "[RESOLVED] $rel_path → kept ours (copied .original → .final)"
+              fi
+
+              if [ -n "$RESOLVED_LIST" ]; then
+                RESOLVED_LIST="${RESOLVED_LIST}, ${rel_path}"
+              else
+                RESOLVED_LIST="$rel_path"
+              fi
+            else
+              REMAINING=$((REMAINING + 1))
+              echo "[SKIPPED]  $rel_path (does not match patterns, needs manual resolution)"
+
+              if [ -n "$REMAINING_LIST" ]; then
+                REMAINING_LIST="${REMAINING_LIST}, ${rel_path}"
+              else
+                REMAINING_LIST="$rel_path"
+              fi
+            fi
+
+          done < <(find "$DRY_RUN_PATH" -name "*.original" -type f 2>/dev/null | sort)
+
+          echo ""
+          echo "============================================"
+          echo "RESOLUTION SUMMARY"
+          echo "============================================"
+          echo "Total conflicts:   $TOTAL"
+          echo "Auto-resolved:     $AUTO_RESOLVED"
+          echo "Remaining:         $REMAINING"
+          echo "Mode:              $([ "$IS_DRY_RUN" = "true" ] && echo "DRY RUN (no changes made)" || echo "APPLIED")"
+          echo "============================================"
+
+          if [ $REMAINING -gt 0 ]; then
+            echo ""
+            echo "⚠ Files still needing manual resolution:"
+            echo "$REMAINING_LIST" | tr ',' '\n' | sed 's/^ */  - /'
+          fi
+
+          if [ $AUTO_RESOLVED -gt 0 ] && [ "$IS_DRY_RUN" = "false" ]; then
+            echo ""
+            echo "✓ Auto-resolved files (kept ours):"
+            echo "$RESOLVED_LIST" | tr ',' '\n' | sed 's/^ */  - /'
+          fi
+
+          # Output as key=value for parsing
+          echo ""
+          echo "OUTPUT_TOTAL=$TOTAL"
+          echo "OUTPUT_AUTO_RESOLVED=$AUTO_RESOLVED"
+          echo "OUTPUT_REMAINING=$REMAINING"
+          echo "OUTPUT_RESOLVED_LIST=$RESOLVED_LIST"
+          echo "OUTPUT_REMAINING_LIST=$REMAINING_LIST"
+          REMOTE_EOF
+
+          # Execute on remote server
+          RESULT=$(sshpass -p "${{ steps.env-secrets.outputs.ssh_pass }}" ssh -o StrictHostKeyChecking=no \
+            "${{ steps.env-secrets.outputs.ssh_user }}@${{ steps.env-secrets.outputs.ssh_host }}" \
+            "bash -s -- '$DRY_RUN_PATH' '$PATTERNS' '$IS_DRY_RUN'" <<< "$REMOTE_SCRIPT")
+
+          echo "$RESULT"
+
+          # Parse outputs
+          TOTAL=$(echo "$RESULT" | grep "^OUTPUT_TOTAL=" | cut -d= -f2)
+          AUTO_RESOLVED=$(echo "$RESULT" | grep "^OUTPUT_AUTO_RESOLVED=" | cut -d= -f2)
+          REMAINING=$(echo "$RESULT" | grep "^OUTPUT_REMAINING=" | cut -d= -f2)
+          RESOLVED_LIST=$(echo "$RESULT" | grep "^OUTPUT_RESOLVED_LIST=" | cut -d= -f2-)
+          REMAINING_LIST=$(echo "$RESULT" | grep "^OUTPUT_REMAINING_LIST=" | cut -d= -f2-)
+
+          {
+            echo "total_conflicts=${TOTAL:-0}"
+            echo "auto_resolved=${AUTO_RESOLVED:-0}"
+            echo "remaining=${REMAINING:-0}"
+            echo "resolved_files=${RESOLVED_LIST:-None}"
+            echo "remaining_files=${REMAINING_LIST:-None}"
+          } >> $GITHUB_OUTPUT
+
+  # ============================================================
+  # Job 2: Teams notification
+  # ============================================================
+  notify-teams:
+    name: Send Teams Notification
+    runs-on: ubuntu-latest
+    needs: resolve-conflicts
+    if: always()
+    env:
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+    steps:
+      - name: Install jq
+        run: |
+          INSTALL_DIR="/tmp/bin"
+          mkdir -p "$INSTALL_DIR"
+
+          if [ ! -x "$INSTALL_DIR/jq" ]; then
+            curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64" -o "$INSTALL_DIR/jq"
+            chmod +x "$INSTALL_DIR/jq"
+          fi
+
+          echo "$INSTALL_DIR" >> $GITHUB_PATH
+
+      - name: Send Teams notification
+        run: |
+          if [ -z "$TEAMS_WEBHOOK_URL" ]; then
+            echo "Teams webhook not configured, skipping"
+            exit 0
+          fi
+
+          ENVIRONMENT="${{ needs.resolve-conflicts.outputs.environment }}"
+          TOTAL="${{ needs.resolve-conflicts.outputs.total_conflicts }}"
+          AUTO_RESOLVED="${{ needs.resolve-conflicts.outputs.auto_resolved }}"
+          REMAINING="${{ needs.resolve-conflicts.outputs.remaining }}"
+          RESOLVED_FILES="${{ needs.resolve-conflicts.outputs.resolved_files }}"
+          REMAINING_FILES="${{ needs.resolve-conflicts.outputs.remaining_files }}"
+          PATTERNS="${{ inputs.auto_resolve_patterns }}"
+          IS_DRY_RUN="${{ inputs.dry_run }}"
+          DRY_RUN_PATH="${{ inputs.dry_run_path }}"
+
+          # Determine status
+          if [ "$IS_DRY_RUN" = "true" ]; then
+            TITLE="🔍 WSO2 IAM Conflict Resolution Preview"
+            THEME_COLOR="0078D4"
+            MODE="Dry Run (no changes made)"
+          elif [ "${REMAINING:-0}" -eq 0 ] && [ "${AUTO_RESOLVED:-0}" -gt 0 ]; then
+            TITLE="✅ WSO2 IAM Conflicts Auto-Resolved"
+            THEME_COLOR="28A745"
+            MODE="Applied"
+          elif [ "${REMAINING:-0}" -gt 0 ]; then
+            TITLE="⚠️ WSO2 IAM Conflicts Partially Resolved"
+            THEME_COLOR="FFA500"
+            MODE="Applied (manual resolution still needed)"
+          else
+            TITLE="ℹ️ WSO2 IAM Conflict Resolution Complete"
+            THEME_COLOR="0078D4"
+            MODE="Applied"
+          fi
+
+          RESOLVE_TIME=$(TZ='Asia/Colombo' date +"%Y-%m-%d %H:%M:%S IST")
+          WORKFLOW_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          FACTS=$(jq -n \
+            --arg env "$ENVIRONMENT" \
+            --arg patterns "$PATTERNS" \
+            --arg total "$TOTAL conflict(s)" \
+            --arg resolved "$AUTO_RESOLVED file(s)" \
+            --arg remaining "$REMAINING file(s)" \
+            --arg mode "$MODE" \
+            --arg actor "${{ github.actor }}" \
+            --arg time "$RESOLVE_TIME" \
+            '[
+              { "name": "🌍 Environment", "value": ("**" + $env + "**") },
+              { "name": "🖥️ Host", "value": "IAM" },
+              { "name": "📋 Total Conflicts", "value": $total },
+              { "name": "✅ Auto-Resolved", "value": $resolved },
+              { "name": "⚠️ Remaining", "value": $remaining },
+              { "name": "🔧 Patterns", "value": $patterns },
+              { "name": "📊 Mode", "value": ("**" + $mode + "**") },
+              { "name": "👤 Triggered By", "value": $actor },
+              { "name": "🕐 Time", "value": $time }
+            ]')
+
+          MAIN_SECTION=$(jq -n \
+            --arg title "$TITLE" \
+            --argjson facts "$FACTS" \
+            '{
+              "activityTitle": $title,
+              "facts": $facts,
+              "markdown": true
+            }')
+
+          SECTIONS="[$MAIN_SECTION]"
+
+          # Add resolved files section
+          if [ -n "$RESOLVED_FILES" ] && [ "$RESOLVED_FILES" != "None" ]; then
+            RESOLVED_FACTS=$(echo "$RESOLVED_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("✅ " + ((.key + 1) | tostring)), "value": .value })')
+
+            RESOLVED_SECTION=$(jq -n \
+              --argjson facts "$RESOLVED_FACTS" \
+              '{
+                "activityTitle": "Auto-Resolved Files (kept ours)",
+                "facts": $facts,
+                "markdown": true
+              }')
+
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson s "$RESOLVED_SECTION" '. + [$s]')
+          fi
+
+          # Add remaining files section
+          if [ -n "$REMAINING_FILES" ] && [ "$REMAINING_FILES" != "None" ]; then
+            REMAINING_FACTS=$(echo "$REMAINING_FILES" | tr ',' '\n' | sed 's/^ *//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | to_entries | map({ "name": ("⚠️ " + ((.key + 1) | tostring)), "value": .value })')
+
+            REMAINING_SECTION=$(jq -n \
+              --argjson facts "$REMAINING_FACTS" \
+              '{
+                "activityTitle": "🚨 Files Needing Manual Resolution",
+                "facts": $facts,
+                "markdown": true
+              }')
+
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson s "$REMAINING_SECTION" '. + [$s]')
+          fi
+
+          # Next steps hint
+          if [ "$IS_DRY_RUN" = "true" ]; then
+            HINT_SECTION=$(jq -n '{
+              "activityTitle": "📌 Next Steps",
+              "text": "This was a preview. To apply, re-run this workflow with **Preview only** unchecked.",
+              "markdown": true
+            }')
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson s "$HINT_SECTION" '. + [$s]')
+          elif [ "${REMAINING:-0}" -eq 0 ]; then
+            HINT_SECTION=$(jq -n '{
+              "activityTitle": "📌 Next Steps",
+              "text": "All conflicts resolved. You can now run the **Apply WSO2 IAM Update** workflow to apply the update.",
+              "markdown": true
+            }')
+            SECTIONS=$(echo "$SECTIONS" | jq --argjson s "$HINT_SECTION" '. + [$s]')
+          fi
+
+          ACTIONS=$(jq -n \
+            --arg workflow_url "$WORKFLOW_URL" \
+            '[
+              {
+                "@type": "OpenUri",
+                "name": "View Workflow Run",
+                "targets": [{ "os": "default", "uri": $workflow_url }]
+              }
+            ]')
+
+          JSON_PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg theme "$THEME_COLOR" \
+            --argjson sections "$SECTIONS" \
+            --argjson actions "$ACTIONS" \
+            '{
+              "@type": "MessageCard",
+              "@context": "http://schema.org/extensions",
+              "themeColor": $theme,
+              "summary": $title,
+              "sections": $sections,
+              "potentialAction": $actions
+            }')
+
+          echo "Sending notification to Teams..."
+
+          HTTP_RESPONSE=$(curl -s -w "\n%{http_code}" \
+            --proxy "${HTTPS_PROXY:-}" \
+            --connect-timeout 30 \
+            --max-time 60 \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "$TEAMS_WEBHOOK_URL")
+
+          HTTP_CODE=$(echo "$HTTP_RESPONSE" | tail -1)
+
+          if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+            echo "::warning::Teams notification failed with code $HTTP_CODE"
+          else
+            echo "Teams notification sent successfully"
+          fi
+
+  # ============================================================
+  # Job 3: Cleanup
+  # ============================================================
+  cleanup:
+    name: Cleanup
+    runs-on: [self-hosted, ansible]
+    needs: [resolve-conflicts, notify-teams]
+    if: always()
+    steps:
+      - name: Cleanup workspace
+        run: |
+          WORKSPACE="${{ github.workspace }}/${{ github.run_id }}-resolve"
+          [ -d "$WORKSPACE" ] && rm -rf "$WORKSPACE"
