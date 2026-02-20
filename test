@@ -1,1 +1,4 @@
-RUN apk add --no-cache curl wget busybox-extras
+ENTRYPOINT ["java", \
+  "-Dspring.config.additional-location=file:/app/config/", \
+  "-Dlogging.config=/app/config/log4j2.xml", \
+  "-jar", "app.jar"]
