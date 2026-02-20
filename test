@@ -1,1 +1,1 @@
-Could you please expedite the process of setting up the LAN connection for my laptop? As I understand, the IP addresses need to be mapped with the IT team to avoid any conflicts. Once that is completed, I will be able to access the internal network from my laptop. Without this setup, it is difficult for me to proceed further.
+RUN apk add --no-cache curl wget busybox-extras
